@@ -1,5 +1,6 @@
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode};
 use crate::plugin::VendorPlugin;
+use crate::plugin::common::extract_version_token;
 
 /// Cisco IOS / IOS XE / NX-OS.
 pub struct CiscoPlugin;
@@ -25,7 +26,7 @@ impl VendorPlugin for CiscoPlugin {
         Some(DetectionResult {
             vendor: "Cisco".to_string(),
             platform: platform.to_string(),
-            version: extract_version(banner),
+            version: extract_version_token(banner),
         })
     }
 
@@ -97,21 +98,6 @@ fn submode_from(inner: &str) -> PromptMode {
         PromptMode::ConfigRouter(rest.trim_start_matches('-').to_string())
     } else {
         PromptMode::Other(inner.to_string())
-    }
-}
-
-/// Extracts the version token from a banner containing `Version X.Y.Z`.
-/// Plain string search rather than regex -- the format is fixed and this
-/// keeps the built-in pattern infallible (no `Regex::new` to `unwrap`).
-fn extract_version(banner: &str) -> Option<String> {
-    let idx = banner.find("Version ")?;
-    let after = &banner[idx + "Version ".len()..];
-    let end = after.find([',', ' ', '\r', '\n']).unwrap_or(after.len());
-    let version = &after[..end];
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
     }
 }
 

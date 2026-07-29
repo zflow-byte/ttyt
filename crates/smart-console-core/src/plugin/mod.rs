@@ -1,6 +1,9 @@
 mod cisco;
+pub(crate) mod common;
+mod comware;
 
 pub use cisco::CiscoPlugin;
+pub use comware::ComwarePlugin;
 
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo};
 
@@ -57,13 +60,24 @@ impl PluginRegistry {
     /// All vendor plugins implemented so far, compiled in. Phase 1: Cisco
     /// only. Phase 2 adds Dell OS10 / Aruba CX / Comware / JunOS here.
     pub fn with_default_plugins() -> Self {
-        PluginRegistry::new(vec![Box::new(CiscoPlugin)])
+        PluginRegistry::new(vec![Box::new(CiscoPlugin), Box::new(ComwarePlugin)])
     }
 
     pub fn detect(&self, banner: &str) -> Option<(&dyn VendorPlugin, DetectionResult)> {
         self.plugins
             .iter()
             .find_map(|p| p.detect(banner).map(|result| (p.as_ref(), result)))
+    }
+
+    /// Looks up an already-registered plugin by [`VendorPlugin::id`] --
+    /// used by the detector (Task 2.5/2.6) to re-find the plugin it
+    /// detected with, across the async boundary, without holding a
+    /// borrowed `&dyn VendorPlugin` alive.
+    pub fn get(&self, id: &str) -> Option<&dyn VendorPlugin> {
+        self.plugins
+            .iter()
+            .find(|p| p.id() == id)
+            .map(|p| p.as_ref())
     }
 
     pub fn plugins(&self) -> &[Box<dyn VendorPlugin>] {
