@@ -1,9 +1,11 @@
+mod aruba_cx;
 mod cisco;
 pub(crate) mod common;
 mod comware;
 mod dell_os10;
 mod junos;
 
+pub use aruba_cx::ArubaCxPlugin;
 pub use cisco::CiscoPlugin;
 pub use comware::ComwarePlugin;
 pub use dell_os10::DellOs10Plugin;
@@ -69,6 +71,7 @@ impl PluginRegistry {
             Box::new(ComwarePlugin),
             Box::new(JunosPlugin),
             Box::new(DellOs10Plugin),
+            Box::new(ArubaCxPlugin),
         ])
     }
 
