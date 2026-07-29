@@ -120,4 +120,57 @@ mod tests {
 
         assert!(registry.detect("some unrelated banner text").is_none());
     }
+
+    /// Per-plugin test files can only ever prove "this plugin recognizes
+    /// its own banner" -- they cannot catch one plugin's `detect()` also
+    /// (incorrectly) matching a different vendor's banner, which is
+    /// exactly the failure mode that would silently misclassify a real
+    /// device. This test checks every (plugin, other vendor's banner)
+    /// pair across all five registered plugins.
+    #[test]
+    fn no_plugin_detects_another_vendors_banner_fixture() {
+        let fixtures: [(&str, &str); 5] = [
+            ("cisco-ios", "Cisco IOS Software, Version 15.2(2)E7"),
+            (
+                "comware",
+                "HPE Comware Platform Software, Version 7.1.070, Release 6555P29",
+            ),
+            (
+                "junos",
+                "--- JUNOS 21.4R3.15 Software Release [export] (Junos) ---",
+            ),
+            (
+                "dell-os10",
+                "Dell EMC Networking OS10-Enterprise\nOS Version: 10.5.2.4",
+            ),
+            (
+                "aruba-cx",
+                "Aruba Operating System (ArubaOS-CX)\nVersion : 10.09.0010",
+            ),
+        ];
+
+        let registry = PluginRegistry::with_default_plugins();
+        assert_eq!(
+            registry.plugins().len(),
+            fixtures.len(),
+            "this test's fixture list must cover every registered plugin"
+        );
+
+        for (owner_id, banner) in fixtures {
+            for plugin in registry.plugins() {
+                if plugin.id() == owner_id {
+                    assert!(
+                        plugin.detect(banner).is_some(),
+                        "{owner_id} should detect its own banner fixture"
+                    );
+                } else {
+                    assert!(
+                        plugin.detect(banner).is_none(),
+                        "{} incorrectly detected {owner_id}'s banner fixture",
+                        plugin.id(),
+                    );
+                }
+            }
+        }
+    }
 }
