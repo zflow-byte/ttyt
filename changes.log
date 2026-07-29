@@ -76,3 +76,105 @@ tests, fmt/clippy clean.
 
 Next: Phase 2 (Dell OS10/Aruba CX/Comware/JunOS plugins, real-time event
 classification wired into the UI, persistent history + Ctrl-R search).
+
+2026-07-29 (continued)
+----------------------
+Phase 2 (Multi-Vendor + Real-Time Parsing) complete. Implemented per
+outputs/2026-07-29-smart-console-plan.md, Tasks 2.1-2.7, in the order
+2.3 -> 2.4 -> 2.1 -> 2.2 -> (cross-vendor matrix) -> 2.5/2.6 -> 2.7
+(Comware/JunOS first since their prompt grammars are the most different
+from Cisco's, surfacing shared-helper design issues earlier; the matrix
+test written immediately once all 5 plugins existed, before the detector
+that depends on all of them).
+
+Delivered:
+- 4 new VendorPlugin implementations (HPE Comware, Juniper JunOS, Dell
+  OS10, HPE Aruba CX), alongside Phase 1's Cisco plugin -- 5 total,
+  registered in PluginRegistry::with_default_plugins().
+- Cross-vendor detection matrix test: one banner fixture per vendor,
+  asserts every plugin detects its own banner and no plugin detects any
+  other vendor's banner.
+- Detector module (core/src/detector.rs): consumes RawLine events,
+  scans up to a 40-line banner window per connection before giving up
+  (VendorDetectionStatus::Unknown), then dispatches every subsequent
+  line to the detected plugin's parse_prompt/parse_output and publishes
+  PromptChanged/Parsed/VendorDetection events. HostnameChanged is
+  computed in the detector (by diffing consecutive PromptInfo.hostname
+  values across parse_prompt calls), not inside any VendorPlugin -- no
+  single plugin call has both the old and new hostname in scope at once,
+  so this is the detector's job, not the plugin's.
+- Live UI wiring: header now shows vendor/platform/version and current
+  prompt mode from real SessionEvents (not placeholders); bottom-left
+  Events pane renders real ParsedEvents with [ERROR]/[WARN]/[HOST]/[LINK]
+  prefixes and theme colors.
+- Persistent, redacted command history: smart_console_core::CommandHistory
+  (0600 file, same redaction as session logs -- entries are redacted
+  before being kept in memory or written to disk, so a past sensitive
+  command can only ever show as [REDACTED], never recovered). Config
+  gained history_path/history_max_entries fields with serde defaults, so
+  a Phase-1-shaped config.toml missing these keys still loads (regression
+  test: phase_1_shaped_toml_missing_history_fields_still_loads).
+- Ctrl-R reverse-history-search in the UI (bash reverse-i-search style):
+  first press enters search, repeated presses cycle to older matches,
+  typing filters, Enter accepts the match into the input line without
+  auto-submitting it, Esc cancels leaving input untouched.
+- 147 automated tests (118 core + 29 ui at initial completion; 33 ui
+  after the post-review fix pass below), all passing. fmt/clippy/test
+  all clean, test suite run 3x to catch flakiness, release build
+  verified.
+
+Scope decision, stated explicitly (plan 2.6 asked for a shared
+Error/Warning/LinkStatus/HostnameChange/Info classification across
+vendors -- worth calling out plainly since 4 of 5 vendors classify
+nothing beyond what's listed here):
+- parse_output severity classification (Error/Warning) is implemented
+  for Cisco (`%FACILITY-SEVERITY-...`) and Comware (`%%NN.../SEVERITY/...`)
+  only, because both vendors' console message formats were confirmed
+  against real documentation. LinkStatus is Cisco-only, for the same
+  reason. JunOS, Dell OS10, and Aruba CX plugins return an empty Vec from
+  parse_output: their console/syslog message formats were not confirmed
+  precisely enough to classify without a real risk of misclassifying an
+  unrelated line as an error or a link event. Guessing a format for a
+  security-facing console tool was judged riskier than shipping "no
+  classification for this vendor yet" -- this is a scope decision, not
+  an oversight, and should be revisited once Phase 3 (or a user with
+  real hardware) can confirm the actual formats.
+- HostnameChanged is emitted only from the detector, never from a
+  plugin's parse_output -- see the detector note above.
+- There is no `Session` struct; connection/detector/recorder/history all
+  key off the same EventBus + Config passed at connect() call sites
+  (single-session CLI, per plan's Phase 1-2 scope).
+
+Explicitly NOT verified against real hardware (same caveat as Phase 1's
+Cisco plugin, now extended to all 4 new vendors):
+- Comware, JunOS, Dell OS10, and Aruba CX banner/prompt/version fixtures
+  are reconstructed from vendor documentation, not captured from or
+  confirmed against real devices. The cross-vendor matrix test proves the
+  5 fixtures don't collide with each other -- it does NOT prove any of
+  them matches what a real device actually sends. Treat all green tests
+  here as "internally consistent," not as "multi-vendor support
+  confirmed." Please verify against real hardware before production use.
+
+Post-implementation review (advisor pass before declaring Phase 2 done)
+found two real defects in the Ctrl-R history-search UI, fixed in a
+follow-up commit:
+- Ctrl+C -- the app's only disconnect/quit path -- was unreachable while
+  history search was active: on_key routed every key except Ctrl+R into
+  the search-mode handler, which had no Ctrl+C case, so it fell into the
+  generic Char arm and was typed into the query as a literal 'c'. Fixed
+  by checking Ctrl+C before the search-mode dispatch (same as Ctrl+R),
+  and having it cancel an active search on the same "get me out"
+  principle.
+- Ctrl+R with an empty history entered search mode anyway, producing a
+  `(reverse-i-search)` line that could never show a match -- typing and
+  Enter were both inert, only Esc/Ctrl+C escaped it. Fixed by showing a
+  hint instead of entering search mode when history is empty.
+- Also bounded app.history (previously unbounded, unlike scrollback/
+  events) to MAX_HISTORY_ENTRIES via a new push_history() method, for
+  consistency rather than a reported defect.
+Full suite re-verified clean after the fixes: 118 core + 33 ui tests
+(4 new regression tests), fmt/clippy clean.
+
+Next: awaiting direction on Phase 3 (Advanced Features & Polish) --
+tabs/split-view, command palette/search, config summary view, plugin
+system hardening, remaining code-quality polish per the plan.

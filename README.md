@@ -5,9 +5,11 @@ Cisco, Dell OS10, Aruba CX, Comware, and JunOS devices — live vendor
 detection, a real-time event feed, automatic redacted session recording,
 and multi-tab sessions, in the spirit of LazyGit/k9s/btop.
 
-**Status: Phase 1 of 3 complete.** Single-session connect/console/record
-works end to end against real serial hardware. Multi-vendor detection,
-persistent history, tabs, and the command palette are Phase 2/3 (see
+**Status: Phase 2 of 3 complete.** Single-session connect/console/record
+works end to end against real serial hardware, with live multi-vendor
+detection (Cisco, Dell OS10, Aruba CX, Comware, JunOS) and persistent
+Ctrl-R command history search. Tabs, the command palette, and a config
+summary view are Phase 3 (see
 `outputs/2026-07-29-smart-console-plan.md` in the parent workspace).
 
 ## Build
@@ -52,10 +54,13 @@ standard location (macOS:
 with defaults on first run.
 
 Keybindings inside the console: `Ctrl+C` disconnect (quits if already
-disconnected — there's no other quit key yet), `Ctrl+L` clear. `Ctrl+N`,
-`Ctrl+P`, `Ctrl+R`, `TAB`, `ESC` are defined by the spec but not
-implemented until Phase 2/3 — pressing them shows a "not yet implemented"
-hint instead of doing nothing silently.
+disconnected — there's no other quit key yet), `Ctrl+L` clear, `Ctrl+R`
+reverse history search (bash `reverse-i-search` style: repeated presses
+cycle to older matches, typing filters, Enter accepts the match into the
+input line without submitting it, Esc cancels). Both `Ctrl+C` and `Ctrl+R`
+work even while a history search is active. `Ctrl+N`, `Ctrl+P`, `TAB`,
+`ESC` are defined by the spec but not implemented until Phase 3 — pressing
+them shows a "not yet implemented" hint instead of doing nothing silently.
 
 ## Session recordings
 
@@ -71,21 +76,40 @@ crate in this project's dependency list, and correct local-timezone
 conversion needs one (or unsafe FFI); see
 `crates/smart-console-core/src/session/time_util.rs` for the reasoning.
 
-## Known limitations (Phase 1)
+## Command history
 
-- Only Cisco IOS/IOS XE/NX-OS is detected. Dell OS10, Aruba CX, Comware,
-  and JunOS plugins are Phase 2.
-- The header's Vendor/Hostname/Mode fields are placeholders (`-`) until
-  Phase 2 wires live plugin detection into the UI.
-- No persistent command history, tabs, command palette, autocomplete, or
-  replay yet (Phase 2/3).
+Submitted commands are persisted to `history.txt` under the same config
+directory as `config.toml`, capped at `history_max_entries` (default 1000).
+**The same redaction control as session recordings applies**: a command is
+redacted before it's kept in memory or written to disk, so a past sensitive
+command can only ever show as `[REDACTED]` in Ctrl-R search, never the
+original value. The file is created `0600`.
+
+## Known limitations (Phase 2)
+
+- Vendor detection scans up to 40 lines after connect looking for a known
+  banner; if none of the 5 plugins match in that window, vendor status
+  becomes `Unknown` rather than continuing to scan indefinitely.
+- Non-Cisco/Comware console message classification (errors/warnings/link
+  status) is not implemented — Dell OS10, Aruba CX, and JunOS `parse_output`
+  return no classified events. This is a deliberate scope decision (see
+  `changes.log`'s Phase 2 entry), not an oversight: their console message
+  formats weren't confirmed precisely enough to classify without risking
+  misclassifying an unrelated line.
+- No tabs, split-view, command palette, autocomplete, session replay, or
+  config summary view yet (Phase 3).
 - Verified on this development machine against this machine's own serial
   ports and via a Unix PTY pair (`serialport::TTYPort::pair()`) for the
   connection manager's read/reconnect logic, plus `ratatui::TestBackend`
   for the TUI's rendering. **Not yet verified against a physical
   USB-serial adapter or a real Cisco/Dell/Aruba/Comware/JunOS device** —
-  the development environment this was built in has neither attached.
-  Please test against real hardware before relying on this for
-  production troubleshooting.
+  the development environment this was built in has neither attached. The
+  4 vendor plugins added in Phase 2 (Comware/JunOS/Dell OS10/Aruba CX) are
+  built from banner/prompt fixtures reconstructed from vendor
+  documentation, not captured from real devices — the cross-vendor
+  detection matrix test only proves the 5 fixtures don't collide with
+  each other, not that they match what a real device sends. Please test
+  against real hardware before relying on this for production
+  troubleshooting.
 - Linux and Windows are not supported yet (macOS only); this is explicit
   Phase 3 groundwork, not a bug.
