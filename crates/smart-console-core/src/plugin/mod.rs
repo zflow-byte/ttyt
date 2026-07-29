@@ -1,9 +1,11 @@
 mod cisco;
 pub(crate) mod common;
 mod comware;
+mod junos;
 
 pub use cisco::CiscoPlugin;
 pub use comware::ComwarePlugin;
+pub use junos::JunosPlugin;
 
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo};
 
@@ -60,7 +62,11 @@ impl PluginRegistry {
     /// All vendor plugins implemented so far, compiled in. Phase 1: Cisco
     /// only. Phase 2 adds Dell OS10 / Aruba CX / Comware / JunOS here.
     pub fn with_default_plugins() -> Self {
-        PluginRegistry::new(vec![Box::new(CiscoPlugin), Box::new(ComwarePlugin)])
+        PluginRegistry::new(vec![
+            Box::new(CiscoPlugin),
+            Box::new(ComwarePlugin),
+            Box::new(JunosPlugin),
+        ])
     }
 
     pub fn detect(&self, banner: &str) -> Option<(&dyn VendorPlugin, DetectionResult)> {
