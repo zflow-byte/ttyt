@@ -1,0 +1,55 @@
+================================================================================
+smart-console — changes.log
+================================================================================
+
+2026-07-29
+----------
+Phase 1 (Foundation) complete. Implemented per
+outputs/2026-07-29-smart-console-plan.md, Tasks 1.1-1.9, in the order
+1.1 -> 1.2 -> 1.3 -> 1.5 -> 1.6 -> 1.4 -> 1.7 -> 1.8 -> 1.9 (recorder/event
+bus built before the connection manager that feeds them, and before the
+Cisco plugin, per architect review).
+
+Delivered:
+- 3-crate Cargo workspace (smart-console-core / smart-console-ui /
+  smart-console-cli), Rust edition 2024, stable toolchain 1.97.1.
+- Config loader (toml + directories), device scanner (/dev/cu.* + USB
+  VID/PID -> vendor name), connection manager (dedicated-thread <->
+  tokio bridge, reconnect with backoff), event bus + line assembler,
+  session recorder with redaction (passwords/secrets/SNMP community
+  strings never hit disk unredacted; 0600/0700 permissions set at
+  creation), VendorPlugin trait + PluginRegistry + Cisco IOS/IOS XE/NX-OS
+  plugin, 4-pane ratatui TUI shell, CLI (`list-devices`, `connect`).
+- 69 automated tests (55 core + 14 ui), all passing. `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace` are all clean; the unwrap/expect/panic deny
+  gate was verified to actually fire (not just declared) before Task 1.1
+  was considered done.
+- Real-machine verification: `list-devices` and `connect --help` run for
+  real on this development machine; `connect` against a nonexistent port
+  produces a clean error instead of a panic; the connection manager was
+  exercised over a real Unix PTY pair (not just mocks).
+
+Explicitly NOT verified (flagged rather than silently claimed complete):
+- No physical USB-serial adapter or real network device (Cisco/Dell/
+  Aruba/Comware/JunOS) was available in this environment. Device scanner,
+  connection manager, and the Cisco plugin's banner/prompt parsing are
+  unit-tested and PTY-tested but not confirmed against real hardware.
+- No real attached terminal (TTY) was available to visually run the
+  interactive `connect` + TUI flow; rendering is verified via
+  `ratatui::TestBackend` snapshots instead of a manual on-screen run.
+- Both gaps are called out in README.md's "Known limitations" section;
+  please test against real hardware/a real terminal before production use.
+
+Deviations from the original spec, documented and justified in
+outputs/2026-07-29-smart-console-design.md:
+- Log timestamps use UTC, not local time -- no date/time crate is in the
+  mandated dependency list, and local-timezone conversion needs one (or
+  unsafe FFI). Implemented a small dependency-free UTC calendar
+  conversion instead (session/time_util.rs).
+- `tokio-serial` was deliberately NOT added; the serial<->tokio bridge
+  uses a dedicated OS thread + channel instead, staying within the
+  mandated crate list.
+
+Next: Phase 2 (Dell OS10/Aruba CX/Comware/JunOS plugins, real-time event
+classification wired into the UI, persistent history + Ctrl-R search).
