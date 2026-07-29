@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smart_console_core::device::{ConnectionHandle, open_serial_transport, scan};
-use smart_console_core::{Config, EventBus, SessionRecorder};
+use smart_console_core::{Config, EventBus, PluginRegistry, SessionRecorder};
 
 pub fn list_devices() -> anyhow::Result<()> {
     let config = Config::load()?;
@@ -56,6 +56,11 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
     let recording_path = recorder.path().display().to_string();
     tokio::spawn(smart_console_core::session::recorder::run(
         recorder,
+        bus.subscribe(),
+    ));
+    tokio::spawn(smart_console_core::detector::run(
+        PluginRegistry::with_default_plugins(),
+        Arc::clone(&bus),
         bus.subscribe(),
     ));
 
