@@ -1,0 +1,13 @@
+[package]
+name = "smart-console-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smart-console-core = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+unicode-width = { workspace = true }
+tracing = { workspace = true }
