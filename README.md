@@ -21,6 +21,28 @@ Requires the Rust stable toolchain (`rustup` — see <https://rustup.rs> if
 cargo build --workspace
 ```
 
+To install the `smart-console` binary onto your `PATH` (so it runs like any
+other CLI tool, without `cargo run --`):
+
+```bash
+cargo install --path crates/smart-console-cli
+```
+
+Re-run the same command with `--force` after pulling changes to update the
+installed binary.
+
+### Homebrew (not yet published)
+
+`Formula/smart-console.rb` is a Homebrew formula for this project, ready
+for once the repo has a GitHub remote and a tagged release — see the
+comment at the top of that file for the two placeholder fields
+(`url`/`sha256`) that need filling in first. Until then it can only be
+exercised locally:
+
+```bash
+brew install --build-from-source ./Formula/smart-console.rb
+```
+
 ## Verify
 
 ```bash
