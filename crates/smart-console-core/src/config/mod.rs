@@ -23,6 +23,18 @@ pub struct Config {
     /// history line; a match redacts the entire line before it is written
     /// to disk (see `session::recorder::Redactor`).
     pub redaction_patterns: Vec<String>,
+    /// Persistent command history file (Phase 2, Ctrl-R search).
+    ///
+    /// `#[serde(default = ...)]`: added after Phase 1 shipped, so a
+    /// Phase-1-shaped `config.toml` on disk (missing these keys) must
+    /// still parse -- without a default, `toml::from_str` would fail and
+    /// the app wouldn't start for anyone who already has a config file.
+    #[serde(default = "default_history_path")]
+    pub history_path: PathBuf,
+    /// Older entries beyond this count are dropped from the in-memory/
+    /// search view (the on-disk file is not truncated retroactively).
+    #[serde(default = "default_history_max_entries")]
+    pub history_max_entries: usize,
 }
 
 impl Config {
@@ -100,6 +112,8 @@ impl Default for Config {
                 // stated safe default here, not an oversight.
                 r"(?i)\bkey\b".to_string(),
             ],
+            history_path: default_history_path(),
+            history_max_entries: default_history_max_entries(),
         }
     }
 }
@@ -107,6 +121,16 @@ impl Default for Config {
 fn project_dirs() -> Result<ProjectDirs, CoreError> {
     ProjectDirs::from("dev", "smart-console", "smart-console")
         .ok_or_else(|| CoreError::Config("could not determine OS config directory".to_string()))
+}
+
+fn default_history_path() -> PathBuf {
+    project_dirs()
+        .map(|dirs| dirs.data_dir().join("history.txt"))
+        .unwrap_or_else(|_| PathBuf::from("history.txt"))
+}
+
+fn default_history_max_entries() -> usize {
+    1000
 }
 
 #[cfg(test)]
@@ -173,6 +197,30 @@ mod tests {
         assert_eq!(loaded.log_retention_days, 42);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase_1_shaped_toml_missing_history_fields_still_loads() {
+        // A config.toml written by Phase 1 (before history_path/
+        // history_max_entries existed) must still parse -- otherwise
+        // every existing user's config file breaks the app on upgrade.
+        let old_toml = r#"
+            baud_candidates = [9600, 38400, 57600, 115200]
+            log_dir = "/tmp/smart-console-old/logs"
+            log_retention_days = 90
+            theme = "dark"
+            dangerous_command_patterns = ["reload"]
+            redaction_patterns = ["(?i)\\bpassword\\b"]
+        "#;
+
+        let config: Config = toml::from_str(old_toml).unwrap();
+        assert_eq!(config.history_max_entries, 1000);
+        assert!(
+            config
+                .history_path
+                .to_string_lossy()
+                .contains("history.txt")
+        );
     }
 
     #[test]
