@@ -14,6 +14,3 @@ regex = { workspace = true }
 tokio = { workspace = true }
 serialport = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "rt"] }
