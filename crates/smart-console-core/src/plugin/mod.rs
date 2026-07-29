@@ -1,10 +1,12 @@
 mod cisco;
 pub(crate) mod common;
 mod comware;
+mod dell_os10;
 mod junos;
 
 pub use cisco::CiscoPlugin;
 pub use comware::ComwarePlugin;
+pub use dell_os10::DellOs10Plugin;
 pub use junos::JunosPlugin;
 
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo};
@@ -66,6 +68,7 @@ impl PluginRegistry {
             Box::new(CiscoPlugin),
             Box::new(ComwarePlugin),
             Box::new(JunosPlugin),
+            Box::new(DellOs10Plugin),
         ])
     }
 
