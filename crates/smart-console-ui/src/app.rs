@@ -19,6 +19,14 @@ const MAX_SCROLLBACK_LINES: usize = 2000;
 /// Bottom-left Events pane keeps only the most recent entries.
 const MAX_PARSED_EVENTS: usize = 200;
 
+/// `App::history` is bounded the same way as every other unbounded-input
+/// buffer here (`scrollback`, `events`) so a long session can't grow it
+/// without limit. `smart_console_core::CommandHistory` enforces its own
+/// (configurable) `max_entries` on the persisted copy; this is a separate,
+/// fixed cap on the in-memory copy this crate owns, since `smart-console-ui`
+/// has no dependency on `Config` to read the configured value from.
+const MAX_HISTORY_ENTRIES: usize = 1000;
+
 /// Ctrl-R reverse-history-search state, active while searching (bash
 /// `reverse-i-search`-style). `query` filters `App::history`; `match_index`
 /// (mod the match count) selects which match is currently previewed, so
@@ -98,6 +106,16 @@ impl App {
         self.scrollback.clear();
     }
 
+    /// Records one submitted command in the in-memory history, bounded to
+    /// `MAX_HISTORY_ENTRIES` the same way `push_line`/`apply_session_event`
+    /// bound `scrollback`/`events`.
+    pub fn push_history(&mut self, line: String) {
+        self.history.push(line);
+        while self.history.len() > MAX_HISTORY_ENTRIES {
+            self.history.remove(0);
+        }
+    }
+
     pub fn apply_session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::RawLine(line) => self.push_line(line),
@@ -128,12 +146,28 @@ impl App {
     /// is the fallback that makes the app exitable without stepping on
     /// the spec's other bindings (ESC is reserved for the Phase 3 menu).
     ///
-    /// Ctrl+R enters/cycles history search regardless of mode; while
-    /// search is active, every other key is handled by
-    /// `on_key_in_history_search` instead of the normal bindings below.
+    /// Ctrl+R enters/cycles history search regardless of mode. Ctrl+C is
+    /// also handled before the search-mode dispatch below: it must stay
+    /// reachable even while searching, since it's the app's only exit
+    /// path (disconnect, then quit on a second press) -- routing it
+    /// through `on_key_in_history_search` instead would swallow it as a
+    /// literal 'c' appended to the query, trapping the user in search
+    /// mode with no way to disconnect or quit. Entering search also
+    /// cancels it, on the same "get me out of here" principle. Every
+    /// other key while searching is handled by `on_key_in_history_search`
+    /// instead of the normal bindings below.
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
             self.cycle_history_search();
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            self.history_search = None;
+            if self.connection_state == ConnectionState::Disconnected {
+                self.should_quit = true;
+            } else {
+                self.disconnect_requested = true;
+            }
             return;
         }
         if self.history_search.is_some() {
@@ -142,13 +176,6 @@ impl App {
         }
 
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                if self.connection_state == ConnectionState::Disconnected {
-                    self.should_quit = true;
-                } else {
-                    self.disconnect_requested = true;
-                }
-            }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => self.clear_console(),
             (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
                 self.set_not_yet_implemented_hint("Ctrl+N")
@@ -172,8 +199,16 @@ impl App {
     }
 
     /// Enters history search on the first Ctrl+R; cycles to the next
-    /// (older) match on subsequent presses while already searching.
+    /// (older) match on subsequent presses while already searching. With
+    /// no history to search, stays out of search mode entirely and shows
+    /// a hint instead -- otherwise the user lands in a
+    /// `(reverse-i-search)` line that can never show a match, with
+    /// typing and Enter both inert and only Esc/Ctrl+C escaping it.
     fn cycle_history_search(&mut self) {
+        if self.history.is_empty() {
+            self.hint = Some("Ctrl+R: no command history yet".to_string());
+            return;
+        }
         match &mut self.history_search {
             Some(search) => search.match_index += 1,
             None => self.history_search = Some(HistorySearchState::default()),
@@ -330,7 +365,7 @@ fn handle_key_event(
 ) -> bool {
     app.on_key(key);
     if let Some(line) = app.take_pending_submit() {
-        app.history.push(line.clone());
+        app.push_history(line.clone());
         let _ = submit_tx.send(line);
     }
     if app.disconnect_requested {
@@ -633,5 +668,73 @@ mod tests {
         );
 
         assert_eq!(app.history, vec!["show version".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_r_with_empty_history_does_not_enter_search_mode() {
+        // Regression test: entering search with no history to search
+        // produced a `(reverse-i-search)` line with no possible match,
+        // typing and Enter both inert -- a dead end escapable only by
+        // Esc/Ctrl+C. Staying out of search mode entirely is simpler and
+        // matches every other "not applicable right now" key, which shows
+        // a hint instead of a stuck UI state.
+        let mut app = App::new();
+        assert!(app.history.is_empty());
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+
+        assert!(app.history_search.is_none());
+        assert_eq!(app.hint.as_deref(), Some("Ctrl+R: no command history yet"));
+    }
+
+    #[test]
+    fn ctrl_c_while_history_search_is_active_still_disconnects_and_cancels_search() {
+        // Regression test: on_key routed every non-Ctrl+R key while
+        // searching into on_key_in_history_search, which had no case for
+        // Ctrl+C -- KeyCode::Char('c') fell into the generic Char arm and
+        // was appended to the search query as a literal 'c'. That made
+        // Ctrl+C -- the app's only disconnect/quit path -- unreachable
+        // for as long as history search was open.
+        let mut app = App::new();
+        app.history = vec!["show version".to_string()];
+        app.connection_state = ConnectionState::Connected;
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        assert!(app.history_search.is_some());
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+
+        assert!(
+            app.history_search.is_none(),
+            "Ctrl+C must cancel search, not type 'c' into the query"
+        );
+        assert!(app.disconnect_requested);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_while_disconnected_quits_even_if_history_search_is_active() {
+        let mut app = App::new();
+        app.history = vec!["show version".to_string()];
+        assert_eq!(app.connection_state, ConnectionState::Disconnected);
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+
+        assert!(app.history_search.is_none());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn history_is_bounded_like_scrollback_and_events() {
+        // Regression test: app.history grew without limit, unlike every
+        // other session-lifetime buffer (scrollback, events), which are
+        // all explicitly capped.
+        let mut app = App::new();
+        for i in 0..(MAX_HISTORY_ENTRIES + 10) {
+            app.push_history(format!("cmd {i}"));
+        }
+        assert_eq!(app.history.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(app.history.first().map(String::as_str), Some("cmd 10"));
     }
 }
