@@ -8,5 +8,5 @@ pub mod session;
 
 pub use config::Config;
 pub use error::CoreError;
-pub use events::{EventBus, SessionEvent};
+pub use events::{ConnectionState, EventBus, SessionEvent};
 pub use session::{Redactor, SessionRecorder};

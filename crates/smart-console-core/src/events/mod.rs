@@ -2,19 +2,29 @@ mod line_assembler;
 
 pub use line_assembler::LineAssembler;
 
+/// Lifecycle state of a device connection, published via
+/// `SessionEvent::ConnectionStateChanged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
 /// Events published on a session's event bus.
 ///
-/// Phase 1 only needs `RawLine` — the recorder and the TUI console pane
-/// both consume assembled device output lines. `ConnectionStateChanged`,
-/// `VendorDetected`, and `Parsed`-style variants are added by the
-/// connection manager (Task 1.4) and the plugin/parser work (Task 1.7,
-/// Phase 2) as those concrete types land, rather than being stubbed out
-/// ahead of time.
+/// `VendorDetected`/`Parsed`-style variants are added by the plugin/parser
+/// work (Task 1.7, Phase 2) as those concrete types land, rather than
+/// being stubbed out ahead of time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// One full line of device output, already assembled from the raw byte
     /// stream by a [`LineAssembler`].
     RawLine(String),
+    /// The connection's lifecycle state changed (connected, dropped,
+    /// reconnecting, ...).
+    ConnectionStateChanged(ConnectionState),
 }
 
 /// A single-producer, multi-consumer fan-out for `SessionEvent`s. Every

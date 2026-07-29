@@ -106,6 +106,16 @@ pub async fn run(
                     tracing::error!(error = %e, "failed to write session log line");
                 }
             }
+            Ok(SessionEvent::ConnectionStateChanged(state)) => {
+                // Not sensitive -- recorded as-is, not passed through the
+                // redactor, so the transcript shows exactly when the link
+                // dropped/reconnected during the session.
+                if let Err(e) =
+                    recorder.record_line(&format!("--- connection state: {state:?} ---"))
+                {
+                    tracing::error!(error = %e, "failed to write session log line");
+                }
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
