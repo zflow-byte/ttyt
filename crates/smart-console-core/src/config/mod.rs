@@ -17,9 +17,12 @@ pub struct Config {
     pub log_retention_days: u32,
     /// Theme name (currently only "dark" is implemented).
     pub theme: String,
-    /// Regex patterns that trigger a confirm-before-send prompt (Phase 3)
-    /// and are treated as sensitive in redaction tooling.
+    /// Regex patterns that trigger a confirm-before-send prompt (Phase 3).
     pub dangerous_command_patterns: Vec<String>,
+    /// Case-insensitive regex patterns checked against every recorded/
+    /// history line; a match redacts the entire line before it is written
+    /// to disk (see `session::recorder::Redactor`).
+    pub redaction_patterns: Vec<String>,
 }
 
 impl Config {
@@ -82,6 +85,13 @@ impl Default for Config {
                 "erase startup-config".to_string(),
                 "no shutdown".to_string(),
                 "shutdown".to_string(),
+            ],
+            redaction_patterns: vec![
+                r"(?i)\bpassword\b".to_string(),
+                r"(?i)\bsecret\b".to_string(),
+                r"(?i)\bcommunity\b".to_string(),
+                r"(?i)\bpre-shared-key\b".to_string(),
+                r"(?i)\bpsk\b".to_string(),
             ],
         }
     }
