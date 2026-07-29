@@ -19,6 +19,16 @@ const MAX_SCROLLBACK_LINES: usize = 2000;
 /// Bottom-left Events pane keeps only the most recent entries.
 const MAX_PARSED_EVENTS: usize = 200;
 
+/// Ctrl-R reverse-history-search state, active while searching (bash
+/// `reverse-i-search`-style). `query` filters `App::history`; `match_index`
+/// (mod the match count) selects which match is currently previewed, so
+/// repeated Ctrl-R cycles to progressively older matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySearchState {
+    pub query: String,
+    pub match_index: usize,
+}
+
 /// Central UI state. `widgets::render` is a pure function of this struct;
 /// `on_key`/`apply_session_event` are the only ways it mutates.
 pub struct App {
@@ -37,9 +47,20 @@ pub struct App {
     pub prompt: Option<PromptInfo>,
     /// Most recent classified events, bounded to `MAX_PARSED_EVENTS`.
     pub events: VecDeque<ParsedEvent>,
+    /// Submitted commands, oldest first. Seeded at startup by the caller
+    /// (from `smart_console_core::CommandHistory::entries()`) and
+    /// appended to live as commands are submitted this session. Already
+    /// redacted where it came from persisted history; commands submitted
+    /// *this* session are kept as-typed here (the persisted copy on disk
+    /// is redacted separately by `CommandHistory::append`, which this
+    /// crate has no dependency on -- see design doc's crate-boundary
+    /// notes) -- Ctrl-R searching this session's own just-typed commands
+    /// is no more exposed than the scrollback already visible on screen.
+    pub history: Vec<String>,
+    pub history_search: Option<HistorySearchState>,
     /// Set by keys the spec defines but this phase doesn't implement yet
-    /// (Ctrl+N/Ctrl+P/Ctrl+R/TAB/ESC) — shown in the bottom-right hints
-    /// pane rather than the keypress being silently swallowed.
+    /// (Ctrl+N/Ctrl+P/TAB/ESC) — shown in the bottom-right hints pane
+    /// rather than the keypress being silently swallowed.
     pub hint: Option<String>,
     pub should_quit: bool,
     pub disconnect_requested: bool,
@@ -57,6 +78,8 @@ impl App {
             vendor_status: None,
             prompt: None,
             events: VecDeque::new(),
+            history: Vec::new(),
+            history_search: None,
             hint: None,
             should_quit: false,
             disconnect_requested: false,
@@ -104,7 +127,20 @@ impl App {
     /// defines Ctrl+C as "disconnect" but no dedicated quit key, so this
     /// is the fallback that makes the app exitable without stepping on
     /// the spec's other bindings (ESC is reserved for the Phase 3 menu).
+    ///
+    /// Ctrl+R enters/cycles history search regardless of mode; while
+    /// search is active, every other key is handled by
+    /// `on_key_in_history_search` instead of the normal bindings below.
     pub fn on_key(&mut self, key: KeyEvent) {
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
+            self.cycle_history_search();
+            return;
+        }
+        if self.history_search.is_some() {
+            self.on_key_in_history_search(key);
+            return;
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if self.connection_state == ConnectionState::Disconnected {
@@ -120,9 +156,6 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 self.set_not_yet_implemented_hint("Ctrl+P")
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
-                self.set_not_yet_implemented_hint("Ctrl+R")
-            }
             (_, KeyCode::Tab) => self.set_not_yet_implemented_hint("TAB"),
             (_, KeyCode::Esc) => self.set_not_yet_implemented_hint("ESC"),
             (_, KeyCode::Enter) => {
@@ -135,6 +168,76 @@ impl App {
             }
             (_, KeyCode::Char(c)) => self.input.push(c),
             _ => {}
+        }
+    }
+
+    /// Enters history search on the first Ctrl+R; cycles to the next
+    /// (older) match on subsequent presses while already searching.
+    fn cycle_history_search(&mut self) {
+        match &mut self.history_search {
+            Some(search) => search.match_index += 1,
+            None => self.history_search = Some(HistorySearchState::default()),
+        }
+    }
+
+    /// Key handling while `history_search` is active: typed characters
+    /// edit the query, Enter accepts the current match into the input
+    /// line (never auto-submits it -- same principle as
+    /// `VendorPlugin::suggestions`), Esc cancels leaving `input`
+    /// untouched.
+    fn on_key_in_history_search(&mut self, key: KeyEvent) {
+        let Some(mut search) = self.history_search.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {} // cancelled: search state dropped, input untouched
+            KeyCode::Enter => {
+                if let Some(matched) = self.current_history_match(&search) {
+                    self.input = matched.to_string();
+                }
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                search.match_index = 0;
+                self.history_search = Some(search);
+            }
+            KeyCode::Char(c) => {
+                search.query.push(c);
+                search.match_index = 0;
+                self.history_search = Some(search);
+            }
+            _ => self.history_search = Some(search),
+        }
+    }
+
+    /// History entries containing `query`, most recently submitted first.
+    pub fn history_matches(&self, query: &str) -> Vec<&str> {
+        self.history
+            .iter()
+            .rev()
+            .filter(|cmd| cmd.contains(query))
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn current_history_match(&self, search: &HistorySearchState) -> Option<&str> {
+        let matches = self.history_matches(&search.query);
+        if matches.is_empty() {
+            return None;
+        }
+        Some(matches[search.match_index % matches.len()])
+    }
+
+    /// What the console pane's input line should display: the normal
+    /// `> {input}` prompt, or a bash-style `(reverse-i-search)` line while
+    /// history search is active.
+    pub fn input_line_display(&self) -> String {
+        match &self.history_search {
+            Some(search) => {
+                let matched = self.current_history_match(search).unwrap_or("");
+                format!("(reverse-i-search)`{}': {matched}", search.query)
+            }
+            None => format!("> {}", self.input),
         }
     }
 }
@@ -227,6 +330,7 @@ fn handle_key_event(
 ) -> bool {
     app.on_key(key);
     if let Some(line) = app.take_pending_submit() {
+        app.history.push(line.clone());
         let _ = submit_tx.send(line);
     }
     if app.disconnect_requested {
@@ -427,5 +531,107 @@ mod tests {
             app.events.front(),
             Some(&ParsedEvent::Warning("warn 5".to_string()))
         );
+    }
+
+    #[test]
+    fn ctrl_r_enters_search_and_shows_most_recent_match_with_empty_query() {
+        let mut app = App::new();
+        app.history = vec!["show version".to_string(), "show ip int brief".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+
+        assert!(app.history_search.is_some());
+        assert_eq!(
+            app.input_line_display(),
+            "(reverse-i-search)`': show ip int brief"
+        );
+    }
+
+    #[test]
+    fn typing_in_search_mode_filters_query_not_the_input_line() {
+        let mut app = App::new();
+        app.history = vec!["show version".to_string(), "show ip int brief".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('v')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('e')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('r')));
+
+        assert_eq!(
+            app.input, "",
+            "typed chars must not leak into input while searching"
+        );
+        assert_eq!(
+            app.input_line_display(),
+            "(reverse-i-search)`ver': show version"
+        );
+    }
+
+    #[test]
+    fn repeated_ctrl_r_cycles_to_next_older_match() {
+        let mut app = App::new();
+        app.history = vec![
+            "show version".to_string(),
+            "show version detail".to_string(),
+        ];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        assert_eq!(
+            app.input_line_display(),
+            "(reverse-i-search)`': show version detail"
+        );
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        assert_eq!(
+            app.input_line_display(),
+            "(reverse-i-search)`': show version"
+        );
+    }
+
+    #[test]
+    fn enter_accepts_match_into_input_without_auto_submitting() {
+        let mut app = App::new();
+        app.history = vec!["show version".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+
+        assert!(app.history_search.is_none(), "search mode should end");
+        assert_eq!(app.input, "show version");
+        assert_eq!(
+            app.take_pending_submit(),
+            None,
+            "accepting a match must never auto-submit it"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_search_without_touching_input() {
+        let mut app = App::new();
+        app.history = vec!["show version".to_string()];
+        app.input = "unrelated".to_string();
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
+
+        assert!(app.history_search.is_none());
+        assert_eq!(app.input, "unrelated");
+    }
+
+    #[test]
+    fn submitted_command_is_appended_to_history_via_handle_key_event() {
+        let mut app = App::new();
+        app.input = "show version".to_string();
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+
+        handle_key_event(
+            &mut app,
+            key(KeyModifiers::NONE, KeyCode::Enter),
+            &submit_tx,
+            &disconnect_tx,
+        );
+
+        assert_eq!(app.history, vec!["show version".to_string()]);
     }
 }

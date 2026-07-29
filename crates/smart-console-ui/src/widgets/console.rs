@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Positi
         .map(|line| Line::from(line.as_str()))
         .collect();
 
-    let prompt = format!("> {}", app.input);
+    let prompt = app.input_line_display();
     lines.push(Line::from(prompt.clone()).style(Style::default().fg(theme.accent)));
 
     let paragraph = Paragraph::new(lines).style(Style::default().fg(theme.foreground));

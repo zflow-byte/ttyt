@@ -9,10 +9,13 @@ use crate::app::App;
 use crate::theme::Theme;
 
 const KEYBINDING_LEGEND: &str = "Ctrl+C disconnect  Ctrl+N session  Ctrl+P palette  Ctrl+L clear  Ctrl+R history  TAB complete  ESC menu";
+const HISTORY_SEARCH_HINT: &str =
+    "history search: type to filter, Ctrl+R again for older match, Enter to accept, Esc to cancel";
 
 /// Bottom-left: parsed events (errors/warnings/link/hostname changes),
-/// most recent visible. Bottom-right: hints -- either the most recent
-/// "not yet implemented" notice or the static keybinding legend.
+/// most recent visible. Bottom-right: hints -- history-search usage while
+/// active, else the most recent "not yet implemented" notice, else the
+/// static keybinding legend.
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -25,7 +28,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(" Hints ");
-    let hints_body = app.hint.as_deref().unwrap_or(KEYBINDING_LEGEND);
+    let hints_body = if app.history_search.is_some() {
+        HISTORY_SEARCH_HINT
+    } else {
+        app.hint.as_deref().unwrap_or(KEYBINDING_LEGEND)
+    };
     let hints = Paragraph::new(Line::from(hints_body))
         .block(hints_block)
         .style(Style::default().fg(theme.foreground));

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smart_console_core::device::{ConnectionHandle, open_serial_transport, scan};
-use smart_console_core::{Config, EventBus, PluginRegistry, SessionRecorder};
+use smart_console_core::{CommandHistory, Config, EventBus, PluginRegistry, SessionRecorder};
 
 pub fn list_devices() -> anyhow::Result<()> {
     let config = Config::load()?;
@@ -69,9 +69,16 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
         open_serial_transport(&reopen_port, baud)
     });
 
+    let mut history = CommandHistory::open(
+        &config.history_path,
+        &config.redaction_patterns,
+        config.history_max_entries,
+    )?;
+
     let mut app = smart_console_ui::App::new();
     app.port_name = Some(port);
     app.recording_path = Some(recording_path);
+    app.history = history.entries().to_vec();
 
     install_panic_hook();
     let mut terminal = smart_console_ui::terminal::init()?;
@@ -91,6 +98,9 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
             tokio::select! {
                 res = &mut ui_future => break res,
                 Some(line) = submit_rx.recv() => {
+                    if let Err(e) = history.append(&line) {
+                        tracing::error!(error = %e, "failed to persist command history");
+                    }
                     if let Err(e) = handle.write_line(&line).await {
                         tracing::error!(error = %e, "failed to write to device");
                     }
