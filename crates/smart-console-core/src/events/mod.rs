@@ -2,6 +2,8 @@ mod line_assembler;
 
 pub use line_assembler::LineAssembler;
 
+use crate::model::{ParsedEvent, PromptInfo, VendorDetectionStatus};
+
 /// Lifecycle state of a device connection, published via
 /// `SessionEvent::ConnectionStateChanged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,10 +15,6 @@ pub enum ConnectionState {
 }
 
 /// Events published on a session's event bus.
-///
-/// `VendorDetected`/`Parsed`-style variants are added by the plugin/parser
-/// work (Task 1.7, Phase 2) as those concrete types land, rather than
-/// being stubbed out ahead of time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// One full line of device output, already assembled from the raw byte
@@ -25,6 +23,13 @@ pub enum SessionEvent {
     /// The connection's lifecycle state changed (connected, dropped,
     /// reconnecting, ...).
     ConnectionStateChanged(ConnectionState),
+    /// The detector (Phase 2) finished its banner-window scan: either a
+    /// vendor was identified, or the window was exhausted with no match.
+    VendorDetection(VendorDetectionStatus),
+    /// A line matched the detected vendor's prompt shape.
+    PromptChanged(PromptInfo),
+    /// A line was classified by the detected vendor's `parse_output`.
+    Parsed(ParsedEvent),
 }
 
 /// A single-producer, multi-consumer fan-out for `SessionEvent`s. Every

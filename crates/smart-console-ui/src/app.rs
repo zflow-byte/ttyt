@@ -4,7 +4,9 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use smart_console_core::{ConnectionState, SessionEvent};
+use smart_console_core::{
+    ConnectionState, ParsedEvent, PromptInfo, SessionEvent, VendorDetectionStatus,
+};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::theme::Theme;
@@ -14,6 +16,9 @@ use crate::widgets;
 /// in-memory buffer without limit.
 const MAX_SCROLLBACK_LINES: usize = 2000;
 
+/// Bottom-left Events pane keeps only the most recent entries.
+const MAX_PARSED_EVENTS: usize = 200;
+
 /// Central UI state. `widgets::render` is a pure function of this struct;
 /// `on_key`/`apply_session_event` are the only ways it mutates.
 pub struct App {
@@ -22,6 +27,16 @@ pub struct App {
     pub connection_state: ConnectionState,
     pub port_name: Option<String>,
     pub recording_path: Option<String>,
+    /// `None` until a `VendorDetection` event arrives -- i.e. detection is
+    /// still in progress (within the banner window). Distinct from
+    /// `Some(VendorDetectionStatus::Unknown)`, which means detection
+    /// finished and found nothing.
+    pub vendor_status: Option<VendorDetectionStatus>,
+    /// Most recent prompt state (hostname/mode), once the detected
+    /// vendor's `parse_prompt` has matched a line.
+    pub prompt: Option<PromptInfo>,
+    /// Most recent classified events, bounded to `MAX_PARSED_EVENTS`.
+    pub events: VecDeque<ParsedEvent>,
     /// Set by keys the spec defines but this phase doesn't implement yet
     /// (Ctrl+N/Ctrl+P/Ctrl+R/TAB/ESC) — shown in the bottom-right hints
     /// pane rather than the keypress being silently swallowed.
@@ -39,6 +54,9 @@ impl App {
             connection_state: ConnectionState::Disconnected,
             port_name: None,
             recording_path: None,
+            vendor_status: None,
+            prompt: None,
+            events: VecDeque::new(),
             hint: None,
             should_quit: false,
             disconnect_requested: false,
@@ -61,6 +79,14 @@ impl App {
         match event {
             SessionEvent::RawLine(line) => self.push_line(line),
             SessionEvent::ConnectionStateChanged(state) => self.connection_state = state,
+            SessionEvent::VendorDetection(status) => self.vendor_status = Some(status),
+            SessionEvent::PromptChanged(prompt) => self.prompt = Some(prompt),
+            SessionEvent::Parsed(event) => {
+                self.events.push_back(event);
+                while self.events.len() > MAX_PARSED_EVENTS {
+                    self.events.pop_front();
+                }
+            }
         }
     }
 
@@ -355,5 +381,51 @@ mod tests {
         }
         assert_eq!(app.scrollback.len(), MAX_SCROLLBACK_LINES);
         assert_eq!(app.scrollback.front().map(String::as_str), Some("line 10"));
+    }
+
+    #[test]
+    fn vendor_status_starts_pending_and_updates_on_detection_event() {
+        let mut app = App::new();
+        assert_eq!(app.vendor_status, None, "no event yet -> pending");
+
+        app.apply_session_event(SessionEvent::VendorDetection(
+            VendorDetectionStatus::Unknown,
+        ));
+        assert_eq!(
+            app.vendor_status,
+            Some(VendorDetectionStatus::Unknown),
+            "Unknown must be a distinct, visible state from pending"
+        );
+    }
+
+    #[test]
+    fn prompt_changed_event_updates_prompt_state() {
+        use smart_console_core::PromptMode;
+
+        let mut app = App::new();
+        assert_eq!(app.prompt, None);
+
+        let prompt = PromptInfo {
+            hostname: "Switch".to_string(),
+            mode: PromptMode::Privileged,
+            privilege: Some(15),
+        };
+        app.apply_session_event(SessionEvent::PromptChanged(prompt.clone()));
+        assert_eq!(app.prompt, Some(prompt));
+    }
+
+    #[test]
+    fn parsed_events_accumulate_and_are_bounded() {
+        let mut app = App::new();
+        for i in 0..(MAX_PARSED_EVENTS + 5) {
+            app.apply_session_event(SessionEvent::Parsed(ParsedEvent::Warning(format!(
+                "warn {i}"
+            ))));
+        }
+        assert_eq!(app.events.len(), MAX_PARSED_EVENTS);
+        assert_eq!(
+            app.events.front(),
+            Some(&ParsedEvent::Warning("warn 5".to_string()))
+        );
     }
 }

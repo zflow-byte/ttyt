@@ -6,6 +6,7 @@ use regex::Regex;
 
 use crate::error::CoreError;
 use crate::events::SessionEvent;
+use crate::session::secure_fs::{create_secure_dir, create_secure_dir_all, open_secure_file};
 use crate::session::time_util::UtcParts;
 
 const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
@@ -116,6 +117,16 @@ pub async fn run(
                     tracing::error!(error = %e, "failed to write session log line");
                 }
             }
+            Ok(SessionEvent::VendorDetection(_))
+            | Ok(SessionEvent::PromptChanged(_))
+            | Ok(SessionEvent::Parsed(_)) => {
+                // Deliberately not recorded: these are all derived from
+                // RawLine events that are already in the transcript, so
+                // recording them too would duplicate every line they were
+                // derived from. Listed explicitly (not a wildcard arm) so
+                // adding a future SessionEvent variant forces a decision
+                // here instead of silently falling through either way.
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
@@ -125,74 +136,6 @@ pub async fn run(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
-}
-
-/// Ensures `path` (e.g. the configured `log_dir`) exists and is `0700`.
-///
-/// Only `path` itself is tightened, never its ancestors: this process
-/// doesn't own directories above its own log directory (they might be the
-/// system temp dir, `~/Library/Application Support`, or similar shared
-/// paths), so `chmod`-ing them would be both wrong and liable to fail with
-/// a permission error in exactly the cases where it matters least.
-/// Ancestors are created with ordinary (unrestricted) permissions via
-/// `create_dir_all`, matching how most per-user app-data tooling behaves.
-#[cfg(unix)]
-fn create_secure_dir_all(path: &Path) -> Result<(), CoreError> {
-    use std::os::unix::fs::DirBuilderExt;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_dir_permissions(path),
-        Err(e) => Err(CoreError::Io(e)),
-    }
-}
-
-#[cfg(not(unix))]
-fn create_secure_dir_all(path: &Path) -> Result<(), CoreError> {
-    std::fs::create_dir_all(path).map_err(CoreError::Io)
-}
-
-#[cfg(unix)]
-fn create_secure_dir(path: &Path) -> Result<(), CoreError> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_dir_permissions(path),
-        Err(e) => Err(CoreError::Io(e)),
-    }
-}
-
-#[cfg(unix)]
-fn tighten_dir_permissions(path: &Path) -> Result<(), CoreError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(CoreError::Io)
-}
-
-#[cfg(not(unix))]
-fn create_secure_dir(path: &Path) -> Result<(), CoreError> {
-    std::fs::create_dir(path).map_err(CoreError::Io)
-}
-
-#[cfg(unix)]
-fn open_secure_file(path: &Path) -> Result<File, CoreError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(CoreError::Io)
-}
-
-#[cfg(not(unix))]
-fn open_secure_file(path: &Path) -> Result<File, CoreError> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(CoreError::Io)
 }
 
 #[cfg(test)]

@@ -8,6 +8,22 @@ pub struct DetectionResult {
     pub version: Option<String>,
 }
 
+/// Outcome of the detector's banner-window scan, published via
+/// `SessionEvent::VendorDetection`.
+///
+/// There is no "pending" variant here: while detection is still in
+/// progress (within the banner window), no event has been published yet
+/// at all, and callers (the UI) should treat "no event received yet" as
+/// pending. `Unknown` is published explicitly once the window is
+/// exhausted with no match, so "detection failed" has a visible signal
+/// distinct from "still waiting" -- silence would otherwise look the same
+/// as both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VendorDetectionStatus {
+    Detected(DetectionResult),
+    Unknown,
+}
+
 /// The CLI mode a device's prompt indicates it is currently in.
 ///
 /// `ConfigIf`/`ConfigRouter` carry whatever submode qualifier the prompt

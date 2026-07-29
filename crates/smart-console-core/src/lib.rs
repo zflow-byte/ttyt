@@ -11,6 +11,6 @@ pub mod session;
 pub use config::Config;
 pub use error::CoreError;
 pub use events::{ConnectionState, EventBus, SessionEvent};
-pub use model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode};
+pub use model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode, VendorDetectionStatus};
 pub use plugin::{CiscoPlugin, PluginRegistry, VendorPlugin};
 pub use session::{Redactor, SessionRecorder};
