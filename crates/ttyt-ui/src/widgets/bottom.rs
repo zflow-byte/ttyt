@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use smart_console_core::{ConnectionState, ParsedEvent};
+use ttyt_core::{ConnectionState, ParsedEvent};
 
 use crate::app::App;
 use crate::theme::Theme;

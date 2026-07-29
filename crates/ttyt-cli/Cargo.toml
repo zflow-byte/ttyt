@@ -1,16 +1,16 @@
 [package]
-name = "smart-console-cli"
+name = "ttyt-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "smart-console"
+name = "ttyt"
 path = "src/main.rs"
 
 [dependencies]
-smart-console-core = { workspace = true }
-smart-console-ui = { workspace = true }
+ttyt-core = { workspace = true }
+ttyt-ui = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

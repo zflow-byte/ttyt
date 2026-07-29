@@ -1,7 +1,7 @@
 use thiserror::Error;
 
-/// Errors surfaced across `smart-console-core` (config, device I/O, session
-/// handling). `smart-console-cli` wraps these in `anyhow` at the top level.
+/// Errors surfaced across `ttyt-core` (config, device I/O, session
+/// handling). `ttyt-cli` wraps these in `anyhow` at the top level.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("I/O error: {0}")]

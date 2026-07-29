@@ -73,7 +73,7 @@ mod tests {
     fn all_four_panes_render_their_titles() {
         let app = App::new();
         let rendered = render_to_string(&app);
-        assert!(rendered.contains("smart-console"), "header title missing");
+        assert!(rendered.contains("ttyt"), "header title missing");
         assert!(rendered.contains("Sessions"), "left panel title missing");
         assert!(rendered.contains("Console"), "console title missing");
         assert!(rendered.contains("Events"), "events title missing");

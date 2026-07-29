@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/smart-console-core",
-    "crates/smart-console-ui",
-    "crates/smart-console-cli",
+    "crates/ttyt-core",
+    "crates/ttyt-ui",
+    "crates/ttyt-cli",
 ]
 
 [workspace.package]
@@ -12,8 +12,8 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-smart-console-core = { path = "crates/smart-console-core" }
-smart-console-ui = { path = "crates/smart-console-ui" }
+ttyt-core = { path = "crates/ttyt-core" }
+ttyt-ui = { path = "crates/ttyt-ui" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 serialport = "4"

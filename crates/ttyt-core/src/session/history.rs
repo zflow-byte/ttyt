@@ -86,7 +86,7 @@ mod tests {
 
     /// A history file path nested inside its own fresh per-test directory
     /// -- matching real usage, where `history_path`'s parent is
-    /// smart-console's own data directory, never the shared system temp
+    /// ttyt's own data directory, never the shared system temp
     /// dir directly. `CommandHistory::open` secures that parent directory
     /// (see `secure_fs::create_secure_dir_all`'s doc comment on why it
     /// only tightens the leaf, never ancestors it doesn't own) -- placing
@@ -96,7 +96,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!(
-                "smart-console-history-test-{label}-{}-{n}",
+                "ttyt-history-test-{label}-{}-{n}",
                 std::process::id()
             ))
             .join("history.txt")

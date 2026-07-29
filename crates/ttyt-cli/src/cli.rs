@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "smart-console",
+    name = "ttyt",
     version,
     about = "TUI serial console for network engineers (Cisco, Dell OS10, Aruba CX, Comware, JunOS)"
 )]

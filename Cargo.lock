@@ -822,46 +822,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
-name = "smart-console-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "smart-console-core",
- "smart-console-ui",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "smart-console-core"
-version = "0.1.0"
-dependencies = [
- "directories",
- "regex",
- "serde",
- "serde_json",
- "serialport",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "smart-console-ui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ratatui",
- "smart-console-core",
- "tokio",
- "tracing",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1088,6 +1048,46 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "ttyt-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ttyt-core",
+ "ttyt-ui",
+]
+
+[[package]]
+name = "ttyt-core"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "regex",
+ "serde",
+ "serde_json",
+ "serialport",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "ttyt-ui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "tokio",
+ "tracing",
+ "ttyt-core",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

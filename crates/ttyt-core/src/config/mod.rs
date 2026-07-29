@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 
-/// smart-console's persisted configuration (`config.toml`).
+/// ttyt's persisted configuration (`config.toml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Baud rates offered when connecting to a device.
@@ -45,7 +45,7 @@ impl Config {
     }
 
     /// The OS-standard config file path
-    /// (macOS: `~/Library/Application Support/smart-console/config.toml`).
+    /// (macOS: `~/Library/Application Support/ttyt/config.toml`).
     pub fn default_path() -> Result<PathBuf, CoreError> {
         project_dirs().map(|dirs| dirs.config_dir().join("config.toml"))
     }
@@ -119,7 +119,7 @@ impl Default for Config {
 }
 
 fn project_dirs() -> Result<ProjectDirs, CoreError> {
-    ProjectDirs::from("dev", "smart-console", "smart-console")
+    ProjectDirs::from("dev", "ttyt", "ttyt")
         .ok_or_else(|| CoreError::Config("could not determine OS config directory".to_string()))
 }
 
@@ -144,10 +144,7 @@ mod tests {
     /// A unique scratch path per test so parallel test runs never collide.
     fn scratch_path(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "smart-console-test-{label}-{}-{n}.toml",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("ttyt-test-{label}-{}-{n}.toml", std::process::id()))
     }
 
     #[test]
@@ -206,7 +203,7 @@ mod tests {
         // every existing user's config file breaks the app on upgrade.
         let old_toml = r#"
             baud_candidates = [9600, 38400, 57600, 115200]
-            log_dir = "/tmp/smart-console-old/logs"
+            log_dir = "/tmp/ttyt-old/logs"
             log_retention_days = 90
             theme = "dark"
             dangerous_command_patterns = ["reload"]

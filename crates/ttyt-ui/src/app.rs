@@ -4,10 +4,8 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use smart_console_core::{
-    ConnectionState, ParsedEvent, PromptInfo, SessionEvent, VendorDetectionStatus,
-};
 use tokio::sync::{broadcast, mpsc};
+use ttyt_core::{ConnectionState, ParsedEvent, PromptInfo, SessionEvent, VendorDetectionStatus};
 
 use crate::theme::Theme;
 use crate::widgets;
@@ -21,9 +19,9 @@ const MAX_PARSED_EVENTS: usize = 200;
 
 /// `App::history` is bounded the same way as every other unbounded-input
 /// buffer here (`scrollback`, `events`) so a long session can't grow it
-/// without limit. `smart_console_core::CommandHistory` enforces its own
+/// without limit. `ttyt_core::CommandHistory` enforces its own
 /// (configurable) `max_entries` on the persisted copy; this is a separate,
-/// fixed cap on the in-memory copy this crate owns, since `smart-console-ui`
+/// fixed cap on the in-memory copy this crate owns, since `ttyt-ui`
 /// has no dependency on `Config` to read the configured value from.
 const MAX_HISTORY_ENTRIES: usize = 1000;
 
@@ -56,7 +54,7 @@ pub struct App {
     /// Most recent classified events, bounded to `MAX_PARSED_EVENTS`.
     pub events: VecDeque<ParsedEvent>,
     /// Submitted commands, oldest first. Seeded at startup by the caller
-    /// (from `smart_console_core::CommandHistory::entries()`) and
+    /// (from `ttyt_core::CommandHistory::entries()`) and
     /// appended to live as commands are submitted this session. Already
     /// redacted where it came from persisted history; commands submitted
     /// *this* session are kept as-typed here (the persisted copy on disk
@@ -287,7 +285,7 @@ impl Default for App {
 /// blocking API doesn't compose with async directly), forwarding key-press
 /// events to the returned channel. Mirrors the same blocking-I/O-on-a-
 /// dedicated-thread pattern used for serial reads in
-/// `smart_console_core::device::connection`.
+/// `ttyt_core::device::connection`.
 pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<KeyEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -313,8 +311,8 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
 /// Drives the TUI until the user quits. `submit_tx` receives each line the
 /// user submits with Enter; `disconnect_tx` receives a `()` each time
 /// Ctrl+C requests a disconnect while connected. Neither channel is acted
-/// on inside this crate -- that keeps `smart-console-ui` decoupled from
-/// `smart-console-core`'s connection/serial types; the caller (the CLI)
+/// on inside this crate -- that keeps `ttyt-ui` decoupled from
+/// `ttyt-core`'s connection/serial types; the caller (the CLI)
 /// owns the `ConnectionHandle` and reacts to both.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
@@ -539,7 +537,7 @@ mod tests {
 
     #[test]
     fn prompt_changed_event_updates_prompt_state() {
-        use smart_console_core::PromptMode;
+        use ttyt_core::PromptMode;
 
         let mut app = App::new();
         assert_eq!(app.prompt, None);

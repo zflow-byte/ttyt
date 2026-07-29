@@ -1,11 +1,11 @@
 [package]
-name = "smart-console-ui"
+name = "ttyt-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-smart-console-core = { workspace = true }
+ttyt-core = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }

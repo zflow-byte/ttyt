@@ -150,10 +150,7 @@ mod tests {
 
     fn scratch_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "smart-console-recorder-test-{}-{n}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("ttyt-recorder-test-{}-{n}", std::process::id()))
     }
 
     fn cleanup(dir: &Path) {

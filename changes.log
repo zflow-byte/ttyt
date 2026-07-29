@@ -178,3 +178,35 @@ Full suite re-verified clean after the fixes: 118 core + 33 ui tests
 Next: awaiting direction on Phase 3 (Advanced Features & Polish) --
 tabs/split-view, command palette/search, config summary view, plugin
 system hardening, remaining code-quality polish per the plan.
+
+2026-07-29 (continued)
+----------------------
+Project renamed from "smart-console" to "ttyt" (user request -- confirmed
+`ttyt` was unclaimed on crates.io before renaming). Mechanical rename, no
+behavior change beyond the OS config/data directory name:
+- Crate directories/names: smart-console-core -> ttyt-core,
+  smart-console-ui -> ttyt-ui, smart-console-cli -> ttyt-cli. Binary name:
+  smart-console -> ttyt.
+- `ProjectDirs::from("dev", "smart-console", "smart-console")` ->
+  `("dev", "ttyt", "ttyt")` -- config/history/logs now live under
+  `~/Library/Application Support/ttyt/` on macOS instead of
+  `.../smart-console/`. No migration was written: there are no real users
+  yet (Phase 1/2 both ran in this sandbox, never against production
+  config), so an old `smart-console/` directory, if one exists on a given
+  machine, is simply orphaned rather than migrated.
+- `Formula/smart-console.rb` -> `Formula/ttyt.rb` (class SmartConsole ->
+  Ttyt), README and all source comments/doc-strings updated to match.
+- `changes.log` (this file) and the pre-existing planning docs under the
+  parent workspace's `outputs/` (`2026-07-29-smart-console-plan.md` /
+  `-design.md`) were deliberately NOT renamed or rewritten -- they're the
+  historical record of what was true when written, under the name the
+  project had at the time. README's references to those two filenames
+  were corrected back after the rename script touched them, since the
+  files on disk still carry the old name.
+- Re-verified clean after the rename: `cargo build --workspace`,
+  `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, and `cargo test --workspace` (3x) all pass -- same 118 core +
+  33 ui tests as before the rename, unchanged in count or content.
+- Reinstalled the `PATH`-installed binary: `cargo uninstall
+  smart-console-cli` then `cargo install --path crates/ttyt-cli`;
+  `ttyt --help` runs correctly from a fresh shell.

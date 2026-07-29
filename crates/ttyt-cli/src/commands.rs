@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use smart_console_core::device::{ConnectionHandle, open_serial_transport, scan};
-use smart_console_core::{CommandHistory, Config, EventBus, PluginRegistry, SessionRecorder};
+use ttyt_core::device::{ConnectionHandle, open_serial_transport, scan};
+use ttyt_core::{CommandHistory, Config, EventBus, PluginRegistry, SessionRecorder};
 
 pub fn list_devices() -> anyhow::Result<()> {
     let config = Config::load()?;
@@ -40,7 +40,7 @@ pub fn list_devices() -> anyhow::Result<()> {
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = smart_console_ui::terminal::restore();
+        let _ = ttyt_ui::terminal::restore();
         original_hook(panic_info);
     }));
 }
@@ -54,11 +54,8 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
 
     let recorder = SessionRecorder::create(&config.log_dir, &config.redaction_patterns)?;
     let recording_path = recorder.path().display().to_string();
-    tokio::spawn(smart_console_core::session::recorder::run(
-        recorder,
-        bus.subscribe(),
-    ));
-    tokio::spawn(smart_console_core::detector::run(
+    tokio::spawn(ttyt_core::session::recorder::run(recorder, bus.subscribe()));
+    tokio::spawn(ttyt_core::detector::run(
         PluginRegistry::with_default_plugins(),
         Arc::clone(&bus),
         bus.subscribe(),
@@ -75,19 +72,19 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
         config.history_max_entries,
     )?;
 
-    let mut app = smart_console_ui::App::new();
+    let mut app = ttyt_ui::App::new();
     app.port_name = Some(port);
     app.recording_path = Some(recording_path);
     app.history = history.entries().to_vec();
 
     install_panic_hook();
-    let mut terminal = smart_console_ui::terminal::init()?;
+    let mut terminal = ttyt_ui::terminal::init()?;
     let mut session_events = bus.subscribe();
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let ui_result = {
-        let mut ui_future = Box::pin(smart_console_ui::run(
+        let mut ui_future = Box::pin(ttyt_ui::run(
             &mut terminal,
             &mut app,
             &mut session_events,
@@ -118,7 +115,7 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
     };
 
     handle.disconnect();
-    smart_console_ui::terminal::restore()?;
+    ttyt_ui::terminal::restore()?;
     ui_result?;
     Ok(())
 }

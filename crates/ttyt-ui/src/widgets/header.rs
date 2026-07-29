@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use smart_console_core::{PromptMode, VendorDetectionStatus};
+use ttyt_core::{PromptMode, VendorDetectionStatus};
 
 use crate::app::App;
 use crate::theme::Theme;
@@ -29,7 +29,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(" smart-console ".bold());
+        .title(" ttyt ".bold());
 
     let paragraph = Paragraph::new(line)
         .block(block)
@@ -68,7 +68,7 @@ fn mode_label(mode: &PromptMode) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use smart_console_core::DetectionResult;
+    use ttyt_core::DetectionResult;
 
     #[test]
     fn vendor_label_pending_vs_unknown_vs_detected_are_all_distinct() {

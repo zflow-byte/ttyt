@@ -1,4 +1,4 @@
-# smart-console
+# ttyt
 
 A terminal-only (TUI) serial/network console for network engineers working
 Cisco, Dell OS10, Aruba CX, Comware, and JunOS devices — live vendor
@@ -10,7 +10,8 @@ works end to end against real serial hardware, with live multi-vendor
 detection (Cisco, Dell OS10, Aruba CX, Comware, JunOS) and persistent
 Ctrl-R command history search. Tabs, the command palette, and a config
 summary view are Phase 3 (see
-`outputs/2026-07-29-smart-console-plan.md` in the parent workspace).
+`outputs/2026-07-29-smart-console-plan.md` in the parent workspace --
+filename kept from before the project was renamed to `ttyt`).
 
 ## Build
 
@@ -21,11 +22,11 @@ Requires the Rust stable toolchain (`rustup` — see <https://rustup.rs> if
 cargo build --workspace
 ```
 
-To install the `smart-console` binary onto your `PATH` (so it runs like any
+To install the `ttyt` binary onto your `PATH` (so it runs like any
 other CLI tool, without `cargo run --`):
 
 ```bash
-cargo install --path crates/smart-console-cli
+cargo install --path crates/ttyt-cli
 ```
 
 Re-run the same command with `--force` after pulling changes to update the
@@ -33,14 +34,14 @@ installed binary.
 
 ### Homebrew (not yet published)
 
-`Formula/smart-console.rb` is a Homebrew formula for this project, ready
+`Formula/ttyt.rb` is a Homebrew formula for this project, ready
 for once the repo has a GitHub remote and a tagged release — see the
 comment at the top of that file for the two placeholder fields
 (`url`/`sha256`) that need filling in first. Until then it can only be
 exercised locally:
 
 ```bash
-brew install --build-from-source ./Formula/smart-console.rb
+brew install --build-from-source ./Formula/ttyt.rb
 ```
 
 ## Verify
@@ -60,19 +61,19 @@ at the root of every crate, not just a convention.
 List serial devices on this machine:
 
 ```bash
-cargo run --bin smart-console -- list-devices
+cargo run --bin ttyt -- list-devices
 ```
 
 Connect to one (macOS callout devices look like `/dev/cu.usbserial-1410`):
 
 ```bash
-cargo run --bin smart-console -- connect --port /dev/cu.usbserial-1410 --baud 9600
+cargo run --bin ttyt -- connect --port /dev/cu.usbserial-1410 --baud 9600
 ```
 
 `--baud` is optional; it defaults to the first entry in `config.toml`'s
 `baud_candidates` (9600 unless you've changed it). Config lives at the OS
 standard location (macOS:
-`~/Library/Application Support/smart-console/config.toml`) and is created
+`~/Library/Application Support/ttyt/config.toml`) and is created
 with defaults on first run.
 
 Keybindings inside the console: `Ctrl+C` disconnect (quits if already
@@ -96,7 +97,7 @@ never a partial edit. Log files are created `0600`, the day directory
 Timestamps in log paths are UTC, not local time — there's no date/time
 crate in this project's dependency list, and correct local-timezone
 conversion needs one (or unsafe FFI); see
-`crates/smart-console-core/src/session/time_util.rs` for the reasoning.
+`crates/ttyt-core/src/session/time_util.rs` for the reasoning.
 
 ## Command history
 
