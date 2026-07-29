@@ -20,7 +20,7 @@ Delivered:
   strings never hit disk unredacted; 0600/0700 permissions set at
   creation), VendorPlugin trait + PluginRegistry + Cisco IOS/IOS XE/NX-OS
   plugin, 4-pane ratatui TUI shell, CLI (`list-devices`, `connect`).
-- 69 automated tests (55 core + 14 ui), all passing. `cargo fmt --check`,
+- 74 automated tests (58 core + 16 ui), all passing. `cargo fmt --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, and
   `cargo test --workspace` are all clean; the unwrap/expect/panic deny
   gate was verified to actually fire (not just declared) before Task 1.1
@@ -50,6 +50,29 @@ outputs/2026-07-29-smart-console-design.md:
 - `tokio-serial` was deliberately NOT added; the serial<->tokio bridge
   uses a dedicated OS thread + channel instead, staying within the
   mandated crate list.
+
+Post-implementation review (advisor pass before declaring Phase 1 done)
+found one real defect and two decisions worth recording explicitly:
+- Ctrl+C while connected set a UI-internal flag that nothing downstream
+  ever read, so it did nothing observable and the "second Ctrl+C quits
+  once disconnected" fallback was unreachable. Fixed: the reader thread
+  now publishes Disconnected on every exit path (not just the
+  too-many-errors path), and a new disconnect_tx channel forwards the
+  request from the UI to the CLI's ConnectionHandle. A regression test
+  (`ctrl_c_while_connected_sends_on_disconnect_tx_not_just_the_app_flag`)
+  now exercises the actual wiring, not just the App struct in isolation.
+- Redaction patterns didn't cover key-based credential syntax
+  (key-string, authentication key, radius-server/tacacs-server key).
+  Added a deliberately broad `\bkey\b` pattern -- over-redaction is the
+  stated safe default for this control.
+- `create_secure_dir_all` originally trusted a pre-existing log_dir's
+  permissions. First fix attempt over-corrected: it tightened every
+  pre-existing ancestor directory, which broke in the test environment
+  (can't chmod the system temp dir) -- caught by running the suite 3x,
+  not a single green run. Corrected to tighten only the leaf log_dir,
+  never its ancestors.
+Full suite re-verified 3x clean after all three fixes: 58 core + 16 ui
+tests, fmt/clippy clean.
 
 Next: Phase 2 (Dell OS10/Aruba CX/Comware/JunOS plugins, real-time event
 classification wired into the UI, persistent history + Ctrl-R search).
