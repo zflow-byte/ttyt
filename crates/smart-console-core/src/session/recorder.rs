@@ -127,18 +127,24 @@ pub async fn run(
     }
 }
 
+/// Ensures `path` (e.g. the configured `log_dir`) exists and is `0700`.
+///
+/// Only `path` itself is tightened, never its ancestors: this process
+/// doesn't own directories above its own log directory (they might be the
+/// system temp dir, `~/Library/Application Support`, or similar shared
+/// paths), so `chmod`-ing them would be both wrong and liable to fail with
+/// a permission error in exactly the cases where it matters least.
+/// Ancestors are created with ordinary (unrestricted) permissions via
+/// `create_dir_all`, matching how most per-user app-data tooling behaves.
 #[cfg(unix)]
 fn create_secure_dir_all(path: &Path) -> Result<(), CoreError> {
     use std::os::unix::fs::DirBuilderExt;
-    if path.exists() {
-        return Ok(());
-    }
     if let Some(parent) = path.parent() {
-        create_secure_dir_all(parent)?;
+        std::fs::create_dir_all(parent)?;
     }
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_dir_permissions(path),
         Err(e) => Err(CoreError::Io(e)),
     }
 }
@@ -153,9 +159,15 @@ fn create_secure_dir(path: &Path) -> Result<(), CoreError> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tighten_dir_permissions(path),
         Err(e) => Err(CoreError::Io(e)),
     }
+}
+
+#[cfg(unix)]
+fn tighten_dir_permissions(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(CoreError::Io)
 }
 
 #[cfg(not(unix))]
@@ -229,6 +241,33 @@ mod tests {
     }
 
     #[test]
+    fn radius_and_tacacs_server_key_lines_are_redacted() {
+        let redactor = Redactor::new(&Config::default().redaction_patterns).unwrap();
+        assert_eq!(
+            redactor.redact("radius-server key MyRadiusSecret"),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redactor.redact("tacacs-server key MyTacacsSecret"),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn key_string_and_authentication_key_lines_are_redacted() {
+        let redactor = Redactor::new(&Config::default().redaction_patterns).unwrap();
+        assert_eq!(
+            redactor.redact("key-string MyKeyStringSecret"),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redactor.redact(" key 7 0822455D0A16"),
+            "[REDACTED]",
+            "authentication key line (e.g. under `key chain`) must be redacted"
+        );
+    }
+
+    #[test]
     fn ordinary_output_line_passes_through_unchanged() {
         let redactor = Redactor::new(&Config::default().redaction_patterns).unwrap();
         let line = "GigabitEthernet0/1 is up, line protocol is up";
@@ -299,6 +338,35 @@ mod tests {
         assert_eq!(file_mode, 0o600, "log file must be 0600");
 
         cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_existing_loosely_permissioned_log_dir_is_tightened_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir();
+        // Simulate a log_dir that already exists (e.g. left over from
+        // before this permission fix, or created by something else) at a
+        // world-readable mode, before SessionRecorder ever touches it.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let recorder =
+            SessionRecorder::create(&dir, &Config::default().redaction_patterns).unwrap();
+
+        let log_dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            log_dir_mode, 0o700,
+            "pre-existing log_dir must be tightened to 0700, not trusted as-is"
+        );
+
+        cleanup(&dir);
+        let _ = recorder;
     }
 
     #[test]

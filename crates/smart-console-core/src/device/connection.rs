@@ -158,7 +158,11 @@ fn reader_loop<F>(
                 ConnectionState::Disconnected,
             ));
             if !reconnect_with_backoff(transport, stop, bus, reopen, &mut backoff) {
-                return; // stop was requested during backoff/retry
+                // stop was requested during backoff/retry -- fall through
+                // to the shared exit path below rather than returning
+                // directly, so this path also flushes and reports
+                // Disconnected exactly like the normal stop path.
+                break;
             }
             consecutive_errors = 0;
             assembler = LineAssembler::new();
@@ -168,6 +172,15 @@ fn reader_loop<F>(
     if let Some(line) = assembler.flush() {
         bus.publish(SessionEvent::RawLine(line));
     }
+    // Always reported on every exit path (explicit disconnect() call,
+    // stop requested mid-backoff, or a poisoned lock) so the UI can rely
+    // on seeing Disconnected rather than the connection silently going
+    // quiet -- otherwise a user-requested disconnect never updates
+    // App::connection_state and the "press Ctrl+C again to quit" fallback
+    // never becomes reachable.
+    bus.publish(SessionEvent::ConnectionStateChanged(
+        ConnectionState::Disconnected,
+    ));
 }
 
 /// Retries `reopen` with bounded exponential backoff. Returns `false` if

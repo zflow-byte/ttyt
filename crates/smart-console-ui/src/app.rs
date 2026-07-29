@@ -147,14 +147,17 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
 }
 
 /// Drives the TUI until the user quits. `submit_tx` receives each line the
-/// user submits with Enter; this crate has no dependency on how (or
-/// whether) a caller sends it anywhere, keeping the UI decoupled from
-/// `smart-console-core`'s connection/serial types.
+/// user submits with Enter; `disconnect_tx` receives a `()` each time
+/// Ctrl+C requests a disconnect while connected. Neither channel is acted
+/// on inside this crate -- that keeps `smart-console-ui` decoupled from
+/// `smart-console-core`'s connection/serial types; the caller (the CLI)
+/// owns the `ConnectionHandle` and reacts to both.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     session_events: &mut broadcast::Receiver<SessionEvent>,
     submit_tx: mpsc::UnboundedSender<String>,
+    disconnect_tx: mpsc::UnboundedSender<()>,
 ) -> std::io::Result<()> {
     let theme = Theme::dark();
     let mut key_events = spawn_input_thread(Duration::from_millis(100));
@@ -166,11 +169,7 @@ pub async fn run<B: Backend>(
             key = key_events.recv() => {
                 match key {
                     Some(key) => {
-                        app.on_key(key);
-                        if let Some(line) = app.take_pending_submit() {
-                            let _ = submit_tx.send(line);
-                        }
-                        if app.should_quit {
+                        if handle_key_event(app, key, &submit_tx, &disconnect_tx) {
                             return Ok(());
                         }
                     }
@@ -188,6 +187,29 @@ pub async fn run<B: Backend>(
     }
 }
 
+/// One key event's worth of `App` mutation plus outbound-channel wiring.
+/// Pulled out of `run`'s select loop so the disconnect_tx/submit_tx wiring
+/// is unit-testable without a real terminal or input thread -- an
+/// `App`-only test can confirm `disconnect_requested` gets set, but not
+/// that anything downstream ever reads it. Returns `true` if the caller
+/// should stop the loop.
+fn handle_key_event(
+    app: &mut App,
+    key: KeyEvent,
+    submit_tx: &mpsc::UnboundedSender<String>,
+    disconnect_tx: &mpsc::UnboundedSender<()>,
+) -> bool {
+    app.on_key(key);
+    if let Some(line) = app.take_pending_submit() {
+        let _ = submit_tx.send(line);
+    }
+    if app.disconnect_requested {
+        app.disconnect_requested = false;
+        let _ = disconnect_tx.send(());
+    }
+    app.should_quit
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -195,6 +217,51 @@ mod tests {
 
     fn key(modifiers: KeyModifiers, code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn ctrl_c_while_connected_sends_on_disconnect_tx_not_just_the_app_flag() {
+        // Regression test: an earlier version set App::disconnect_requested
+        // but nothing downstream ever consumed it, so Ctrl+C while
+        // connected did nothing observable outside the App struct.
+        let mut app = App::new();
+        app.connection_state = ConnectionState::Connected;
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, mut disconnect_rx) = mpsc::unbounded_channel();
+
+        let should_stop = handle_key_event(
+            &mut app,
+            key(KeyModifiers::CONTROL, KeyCode::Char('c')),
+            &submit_tx,
+            &disconnect_tx,
+        );
+
+        assert!(!should_stop);
+        assert!(
+            !app.disconnect_requested,
+            "flag should be cleared once forwarded"
+        );
+        assert!(
+            disconnect_rx.try_recv().is_ok(),
+            "disconnect_tx should have received a signal"
+        );
+    }
+
+    #[test]
+    fn enter_forwards_submitted_line_through_handle_key_event() {
+        let mut app = App::new();
+        app.input = "show version".to_string();
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+
+        handle_key_event(
+            &mut app,
+            key(KeyModifiers::NONE, KeyCode::Enter),
+            &submit_tx,
+            &disconnect_tx,
+        );
+
+        assert_eq!(submit_rx.try_recv().ok(), Some("show version".to_string()));
     }
 
     #[test]

@@ -72,6 +72,7 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
     let mut terminal = smart_console_ui::terminal::init()?;
     let mut session_events = bus.subscribe();
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let ui_result = {
         let mut ui_future = Box::pin(smart_console_ui::run(
@@ -79,6 +80,7 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
             &mut app,
             &mut session_events,
             submit_tx,
+            disconnect_tx,
         ));
         loop {
             tokio::select! {
@@ -87,6 +89,14 @@ pub async fn connect(port: String, baud: Option<u32>) -> anyhow::Result<()> {
                     if let Err(e) = handle.write_line(&line).await {
                         tracing::error!(error = %e, "failed to write to device");
                     }
+                }
+                Some(()) = disconnect_rx.recv() => {
+                    // Ctrl+C while connected: stop the reader thread now
+                    // rather than waiting for the TUI to quit. The reader
+                    // thread publishes ConnectionStateChanged(Disconnected)
+                    // on its way out, which flows back to `app` and makes
+                    // a second Ctrl+C quit the app per App::on_key.
+                    handle.disconnect();
                 }
             }
         }

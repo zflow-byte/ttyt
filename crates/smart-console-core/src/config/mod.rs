@@ -92,6 +92,13 @@ impl Default for Config {
                 r"(?i)\bcommunity\b".to_string(),
                 r"(?i)\bpre-shared-key\b".to_string(),
                 r"(?i)\bpsk\b".to_string(),
+                // Broader than the above on purpose: `key-string`,
+                // `authentication key 7 <hash>`, `radius-server key`,
+                // `tacacs-server key`, and `ntp authentication-key` all
+                // carry a credential but don't match "password"/"secret".
+                // Over-redacting a benign line containing "key" is the
+                // stated safe default here, not an oversight.
+                r"(?i)\bkey\b".to_string(),
             ],
         }
     }
