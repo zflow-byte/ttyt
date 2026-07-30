@@ -24,14 +24,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     render_events(frame, columns[0], app, theme);
 
+    let session = app.active_session();
     let hints_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(" Hints ");
-    let hints_body = if app.history_search.is_some() {
+    let hints_body = if session.is_history_search_active() {
         HISTORY_SEARCH_HINT
     } else {
-        app.hint.as_deref().unwrap_or(KEYBINDING_LEGEND)
+        session.hint.as_deref().unwrap_or(KEYBINDING_LEGEND)
     };
     let hints = Paragraph::new(Line::from(hints_body))
         .block(hints_block)
@@ -47,8 +48,9 @@ fn render_events(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.events.is_empty() {
-        let placeholder = if app.connection_state == ConnectionState::Connected {
+    let session = app.active_session();
+    if session.events.is_empty() {
+        let placeholder = if session.connection_state == ConnectionState::Connected {
             "(no events yet)"
         } else {
             "(not connected)"
@@ -60,8 +62,8 @@ fn render_events(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 
     let visible_rows = inner.height as usize;
-    let start = app.events.len().saturating_sub(visible_rows);
-    let lines: Vec<Line> = app
+    let start = session.events.len().saturating_sub(visible_rows);
+    let lines: Vec<Line> = session
         .events
         .iter()
         .skip(start)

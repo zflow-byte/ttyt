@@ -15,13 +15,16 @@ pub struct Cli {
 pub enum Command {
     /// List serial devices found on this machine (macOS: /dev/cu.*)
     ListDevices,
-    /// Connect to a serial device and open the console
+    /// Connect to one or more serial devices and open the console
     Connect {
-        /// Serial port path, e.g. /dev/cu.usbserial-1410 (see `list-devices`)
-        #[arg(long)]
-        port: String,
-        /// Baud rate. Defaults to the first configured candidate (9600
-        /// unless changed in config.toml).
+        /// Serial port path, e.g. /dev/cu.usbserial-1410 (see
+        /// `list-devices`). Repeat `--port` for multiple concurrent
+        /// sessions opened as tabs; Ctrl+N cycles between them.
+        #[arg(long = "port", required = true)]
+        ports: Vec<String>,
+        /// Baud rate, applied to every `--port` given. Defaults to the
+        /// first configured candidate (9600 unless changed in
+        /// config.toml).
         #[arg(long)]
         baud: Option<u32>,
     },

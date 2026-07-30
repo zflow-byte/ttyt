@@ -11,7 +11,7 @@ pub mod session;
 
 pub use config::Config;
 pub use error::CoreError;
-pub use events::{ConnectionState, EventBus, SessionEvent};
+pub use events::{ConnectionState, EventBus, SessionEvent, SessionId};
 pub use model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode, VendorDetectionStatus};
 pub use plugin::{
     ArubaCxPlugin, CiscoPlugin, ComwarePlugin, DellOs10Plugin, JunosPlugin, PluginRegistry,

@@ -1056,6 +1056,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serialport",
  "tokio",
  "tracing",
  "tracing-subscriber",

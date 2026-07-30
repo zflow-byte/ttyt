@@ -4,6 +4,26 @@ pub use line_assembler::LineAssembler;
 
 use crate::model::{ParsedEvent, PromptInfo, VendorDetectionStatus};
 
+/// Identifies one connection/tab among possibly several concurrent
+/// sessions (Phase 3 tabs). Assigned once when a session is created from
+/// its position in the CLI's `--port` list and never reused -- stable
+/// enough to key the UI's `Vec<Session>` and the CLI's parallel
+/// `Vec<ConnectionHandle>`/`Vec<CommandHistory>` by the same value without
+/// the two ever silently desynchronizing (sessions are never removed at
+/// runtime in Phase 3 -- see the design doc's tabs note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(usize);
+
+impl SessionId {
+    pub fn new(index: usize) -> SessionId {
+        SessionId(index)
+    }
+
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// Lifecycle state of a device connection, published via
 /// `SessionEvent::ConnectionStateChanged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +90,16 @@ impl Default for EventBus {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn session_id_round_trips_its_index_and_compares_by_value() {
+        let a = SessionId::new(0);
+        let b = SessionId::new(1);
+        assert_eq!(a.index(), 0);
+        assert_eq!(b.index(), 1);
+        assert_ne!(a, b);
+        assert_eq!(a, SessionId::new(0));
+    }
 
     #[tokio::test]
     async fn two_subscribers_each_receive_all_published_events() {

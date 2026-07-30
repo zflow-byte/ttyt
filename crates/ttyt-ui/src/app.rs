@@ -4,8 +4,10 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use tokio::sync::{broadcast, mpsc};
-use ttyt_core::{ConnectionState, ParsedEvent, PromptInfo, SessionEvent, VendorDetectionStatus};
+use tokio::sync::mpsc;
+use ttyt_core::{
+    ConnectionState, ParsedEvent, PromptInfo, SessionEvent, SessionId, VendorDetectionStatus,
+};
 
 use crate::theme::Theme;
 use crate::widgets;
@@ -17,27 +19,44 @@ const MAX_SCROLLBACK_LINES: usize = 2000;
 /// Bottom-left Events pane keeps only the most recent entries.
 const MAX_PARSED_EVENTS: usize = 200;
 
-/// `App::history` is bounded the same way as every other unbounded-input
-/// buffer here (`scrollback`, `events`) so a long session can't grow it
-/// without limit. `ttyt_core::CommandHistory` enforces its own
+/// `Session::history` is bounded the same way as every other unbounded-
+/// input buffer here (`scrollback`, `events`) so a long session can't grow
+/// it without limit. `ttyt_core::CommandHistory` enforces its own
 /// (configurable) `max_entries` on the persisted copy; this is a separate,
 /// fixed cap on the in-memory copy this crate owns, since `ttyt-ui`
 /// has no dependency on `Config` to read the configured value from.
 const MAX_HISTORY_ENTRIES: usize = 1000;
 
 /// Ctrl-R reverse-history-search state, active while searching (bash
-/// `reverse-i-search`-style). `query` filters `App::history`; `match_index`
-/// (mod the match count) selects which match is currently previewed, so
-/// repeated Ctrl-R cycles to progressively older matches.
+/// `reverse-i-search`-style). `query` filters `Session::history`;
+/// `match_index` (mod the match count) selects which match is currently
+/// previewed, so repeated Ctrl-R cycles to progressively older matches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistorySearchState {
     pub query: String,
     pub match_index: usize,
 }
 
-/// Central UI state. `widgets::render` is a pure function of this struct;
-/// `on_key`/`apply_session_event` are the only ways it mutates.
-pub struct App {
+/// A session's modal input state. At most one is active at a time --
+/// modeling this as one enum rather than several `Option<T>` fields makes
+/// the mutual exclusion structural instead of a convention every new
+/// overlay (palette, autocomplete, confirm-send in later Phase 3 tasks)
+/// has to remember to preserve. `on_key`'s global keys (Ctrl+C, Ctrl+N,
+/// Ctrl+R) are checked before this dispatch, same principle either way:
+/// a key that must always be reachable is handled before any mode gets a
+/// chance to swallow it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum Mode {
+    #[default]
+    Normal,
+    HistorySearch(HistorySearchState),
+}
+
+/// One connection/tab's worth of UI state. `App` owns a `Vec<Session>`;
+/// `widgets::render` and `on_key` always act on whichever one is
+/// currently focused (`App::active_session`).
+pub struct Session {
+    pub id: SessionId,
     pub scrollback: VecDeque<String>,
     pub input: String,
     pub connection_state: ConnectionState,
@@ -54,28 +73,28 @@ pub struct App {
     /// Most recent classified events, bounded to `MAX_PARSED_EVENTS`.
     pub events: VecDeque<ParsedEvent>,
     /// Submitted commands, oldest first. Seeded at startup by the caller
-    /// (from `ttyt_core::CommandHistory::entries()`) and
-    /// appended to live as commands are submitted this session. Already
-    /// redacted where it came from persisted history; commands submitted
-    /// *this* session are kept as-typed here (the persisted copy on disk
-    /// is redacted separately by `CommandHistory::append`, which this
-    /// crate has no dependency on -- see design doc's crate-boundary
-    /// notes) -- Ctrl-R searching this session's own just-typed commands
-    /// is no more exposed than the scrollback already visible on screen.
+    /// (from `ttyt_core::CommandHistory::entries()`) and appended to live
+    /// as commands are submitted this session. Already redacted where it
+    /// came from persisted history; commands submitted *this* session are
+    /// kept as-typed here (the persisted copy on disk is redacted
+    /// separately by `CommandHistory::append`, which this crate has no
+    /// dependency on -- see design doc's crate-boundary notes) -- Ctrl-R
+    /// searching this session's own just-typed commands is no more
+    /// exposed than the scrollback already visible on screen.
     pub history: Vec<String>,
-    pub history_search: Option<HistorySearchState>,
+    pub(crate) mode: Mode,
     /// Set by keys the spec defines but this phase doesn't implement yet
-    /// (Ctrl+N/Ctrl+P/TAB/ESC) — shown in the bottom-right hints pane
-    /// rather than the keypress being silently swallowed.
+    /// (Ctrl+P/TAB/ESC) — shown in the bottom-right hints pane rather than
+    /// the keypress being silently swallowed.
     pub hint: Option<String>,
-    pub should_quit: bool,
     pub disconnect_requested: bool,
     pending_submit: Option<String>,
 }
 
-impl App {
-    pub fn new() -> Self {
-        App {
+impl Session {
+    fn new(id: SessionId) -> Self {
+        Session {
+            id,
             scrollback: VecDeque::new(),
             input: String::new(),
             connection_state: ConnectionState::Disconnected,
@@ -85,9 +104,8 @@ impl App {
             prompt: None,
             events: VecDeque::new(),
             history: Vec::new(),
-            history_search: None,
+            mode: Mode::Normal,
             hint: None,
-            should_quit: false,
             disconnect_requested: false,
             pending_submit: None,
         }
@@ -105,8 +123,8 @@ impl App {
     }
 
     /// Records one submitted command in the in-memory history, bounded to
-    /// `MAX_HISTORY_ENTRIES` the same way `push_line`/`apply_session_event`
-    /// bound `scrollback`/`events`.
+    /// `MAX_HISTORY_ENTRIES` the same way `push_line`/`apply` bound
+    /// `scrollback`/`events`.
     pub fn push_history(&mut self, line: String) {
         self.history.push(line);
         while self.history.len() > MAX_HISTORY_ENTRIES {
@@ -114,7 +132,7 @@ impl App {
         }
     }
 
-    pub fn apply_session_event(&mut self, event: SessionEvent) {
+    fn apply(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::RawLine(line) => self.push_line(line),
             SessionEvent::ConnectionStateChanged(state) => self.connection_state = state,
@@ -138,46 +156,23 @@ impl App {
         self.hint = Some(format!("{key}: not yet implemented"));
     }
 
-    /// Handles one key event. Ctrl+C requests a disconnect; pressed again
-    /// once already disconnected, it quits the app instead -- the spec
-    /// defines Ctrl+C as "disconnect" but no dedicated quit key, so this
-    /// is the fallback that makes the app exitable without stepping on
-    /// the spec's other bindings (ESC is reserved for the Phase 3 menu).
-    ///
-    /// Ctrl+R enters/cycles history search regardless of mode. Ctrl+C is
-    /// also handled before the search-mode dispatch below: it must stay
-    /// reachable even while searching, since it's the app's only exit
-    /// path (disconnect, then quit on a second press) -- routing it
-    /// through `on_key_in_history_search` instead would swallow it as a
-    /// literal 'c' appended to the query, trapping the user in search
-    /// mode with no way to disconnect or quit. Entering search also
-    /// cancels it, on the same "get me out of here" principle. Every
-    /// other key while searching is handled by `on_key_in_history_search`
-    /// instead of the normal bindings below.
-    pub fn on_key(&mut self, key: KeyEvent) {
+    /// Handles one key event already known to be scoped to this session
+    /// (global keys -- Ctrl+C, Ctrl+N -- are intercepted by `App::on_key`
+    /// before reaching here). Ctrl+R enters/cycles history search
+    /// regardless of mode; while searching, every other key is handled by
+    /// `on_key_in_history_search` instead of the normal bindings below.
+    fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
             self.cycle_history_search();
             return;
         }
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-            self.history_search = None;
-            if self.connection_state == ConnectionState::Disconnected {
-                self.should_quit = true;
-            } else {
-                self.disconnect_requested = true;
-            }
-            return;
-        }
-        if self.history_search.is_some() {
+        if matches!(self.mode, Mode::HistorySearch(_)) {
             self.on_key_in_history_search(key);
             return;
         }
 
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => self.clear_console(),
-            (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-                self.set_not_yet_implemented_hint("Ctrl+N")
-            }
             (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 self.set_not_yet_implemented_hint("Ctrl+P")
             }
@@ -207,23 +202,23 @@ impl App {
             self.hint = Some("Ctrl+R: no command history yet".to_string());
             return;
         }
-        match &mut self.history_search {
-            Some(search) => search.match_index += 1,
-            None => self.history_search = Some(HistorySearchState::default()),
+        match &mut self.mode {
+            Mode::HistorySearch(search) => search.match_index += 1,
+            Mode::Normal => self.mode = Mode::HistorySearch(HistorySearchState::default()),
         }
     }
 
-    /// Key handling while `history_search` is active: typed characters
-    /// edit the query, Enter accepts the current match into the input
-    /// line (never auto-submits it -- same principle as
+    /// Key handling while `mode` is `HistorySearch`: typed characters edit
+    /// the query, Enter accepts the current match into the input line
+    /// (never auto-submits it -- same principle as
     /// `VendorPlugin::suggestions`), Esc cancels leaving `input`
     /// untouched.
     fn on_key_in_history_search(&mut self, key: KeyEvent) {
-        let Some(mut search) = self.history_search.take() else {
+        let Mode::HistorySearch(mut search) = std::mem::take(&mut self.mode) else {
             return;
         };
         match key.code {
-            KeyCode::Esc => {} // cancelled: search state dropped, input untouched
+            KeyCode::Esc => {} // cancelled: mode reset to Normal, input untouched
             KeyCode::Enter => {
                 if let Some(matched) = self.current_history_match(&search) {
                     self.input = matched.to_string();
@@ -232,14 +227,14 @@ impl App {
             KeyCode::Backspace => {
                 search.query.pop();
                 search.match_index = 0;
-                self.history_search = Some(search);
+                self.mode = Mode::HistorySearch(search);
             }
             KeyCode::Char(c) => {
                 search.query.push(c);
                 search.match_index = 0;
-                self.history_search = Some(search);
+                self.mode = Mode::HistorySearch(search);
             }
-            _ => self.history_search = Some(search),
+            _ => self.mode = Mode::HistorySearch(search),
         }
     }
 
@@ -261,17 +256,126 @@ impl App {
         Some(matches[search.match_index % matches.len()])
     }
 
+    pub(crate) fn is_history_search_active(&self) -> bool {
+        matches!(self.mode, Mode::HistorySearch(_))
+    }
+
     /// What the console pane's input line should display: the normal
     /// `> {input}` prompt, or a bash-style `(reverse-i-search)` line while
     /// history search is active.
     pub fn input_line_display(&self) -> String {
-        match &self.history_search {
-            Some(search) => {
+        match &self.mode {
+            Mode::HistorySearch(search) => {
                 let matched = self.current_history_match(search).unwrap_or("");
                 format!("(reverse-i-search)`{}': {matched}", search.query)
             }
-            None => format!("> {}", self.input),
+            Mode::Normal => format!("> {}", self.input),
         }
+    }
+}
+
+/// Central UI state: one or more concurrent `Session`s (Phase 3 tabs) plus
+/// which one is currently focused. `widgets::render` is a pure function of
+/// this struct; `on_key`/`apply_session_event` are the only ways it
+/// mutates.
+pub struct App {
+    pub sessions: Vec<Session>,
+    /// Index into `sessions` of the tab currently shown/typed into. Not
+    /// the same thing as a `SessionId`: this changes on every Ctrl+N,
+    /// `SessionId` never does.
+    pub active: usize,
+    pub should_quit: bool,
+}
+
+impl App {
+    /// A single-session app (the common case: `connect --port X`).
+    pub fn new() -> Self {
+        App::with_session_count(1)
+    }
+
+    /// `n` concurrent sessions (Phase 3: `connect --port A --port B ...`),
+    /// each with its own `SessionId` equal to its fixed position in
+    /// `sessions` -- stable for the process lifetime since Phase 3 never
+    /// adds or removes a tab at runtime (see design doc's tabs note).
+    pub fn with_session_count(n: usize) -> Self {
+        let n = n.max(1);
+        App {
+            sessions: (0..n).map(|i| Session::new(SessionId::new(i))).collect(),
+            active: 0,
+            should_quit: false,
+        }
+    }
+
+    pub fn active_session(&self) -> &Session {
+        &self.sessions[self.active]
+    }
+
+    pub fn active_session_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.active]
+    }
+
+    /// Routes an event tagged with the `SessionId` it came from to the
+    /// matching session. Silently ignored if no session with that id
+    /// exists (shouldn't happen in practice -- every id in play was
+    /// created from `sessions`' own positions), rather than panicking on
+    /// what would otherwise be an internal-wiring bug.
+    pub fn apply_session_event(&mut self, id: SessionId, event: SessionEvent) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.apply(event);
+        }
+    }
+
+    /// Cycles the focused tab forward, wrapping around. A single-session
+    /// app has nothing to cycle to; shows a hint rather than doing
+    /// nothing silently, same as any other currently-inapplicable key.
+    fn cycle_active_session(&mut self) {
+        if self.sessions.len() <= 1 {
+            self.active_session_mut().hint = Some("Ctrl+N: only one session".to_string());
+            return;
+        }
+        self.active = (self.active + 1) % self.sessions.len();
+    }
+
+    /// Ctrl+C always disconnects the *focused* tab if it's not already
+    /// disconnected. If it is, the app quits only once every other
+    /// session has also reached `Disconnected` -- otherwise a lone
+    /// already-disconnected tab would let Ctrl+C tear down the whole app
+    /// out from under sessions that are still live. Cancels the focused
+    /// tab's mode too, on the same "get me out of here" principle Ctrl+C
+    /// already had in the single-session phases.
+    fn handle_ctrl_c(&mut self) {
+        let others_still_up =
+            self.sessions.iter().enumerate().any(|(i, s)| {
+                i != self.active && s.connection_state != ConnectionState::Disconnected
+            });
+
+        let session = self.active_session_mut();
+        session.mode = Mode::Normal;
+        if session.connection_state != ConnectionState::Disconnected {
+            session.disconnect_requested = true;
+        } else if !others_still_up {
+            self.should_quit = true;
+        }
+        // else: this tab is already disconnected but another tab isn't --
+        // no-op, matching the doc comment above.
+    }
+
+    /// Handles one key event. Global keys (Ctrl+C, Ctrl+N) are checked
+    /// before anything session-scoped: they must stay reachable
+    /// regardless of the focused session's mode, for the same reason
+    /// Ctrl+C had to be checked before history search's own key dispatch
+    /// in Phase 2 -- routing it through a mode's handler risks the mode
+    /// swallowing it as ordinary input instead.
+    pub fn on_key(&mut self, key: KeyEvent) {
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('n') {
+            self.cycle_active_session();
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            self.handle_ctrl_c();
+            return;
+        }
+        self.active_session_mut().on_key(key);
     }
 }
 
@@ -308,18 +412,24 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
     rx
 }
 
-/// Drives the TUI until the user quits. `submit_tx` receives each line the
-/// user submits with Enter; `disconnect_tx` receives a `()` each time
-/// Ctrl+C requests a disconnect while connected. Neither channel is acted
-/// on inside this crate -- that keeps `ttyt-ui` decoupled from
-/// `ttyt-core`'s connection/serial types; the caller (the CLI)
-/// owns the `ConnectionHandle` and reacts to both.
+/// Drives the TUI until the user quits. `session_events` delivers events
+/// tagged with the `SessionId` they came from -- the caller (the CLI) is
+/// responsible for fanning each session's own `broadcast::Receiver` into
+/// this single tagged channel (see `commands.rs`'s per-session forwarder
+/// tasks); `tokio::select!` can't fan over a `Vec` of receivers directly,
+/// and pulling in `StreamMap`/`SelectAll` would mean an undeclared crate
+/// (see design doc's mandated-crate-list constraint). `submit_tx`/
+/// `disconnect_tx` are likewise tagged with the `SessionId` whose input
+/// line was submitted / whose Ctrl+C requested a disconnect. Neither
+/// inbound nor outbound channel is acted on inside this crate -- that
+/// keeps `ttyt-ui` decoupled from `ttyt-core`'s connection/serial types;
+/// the caller owns every session's `ConnectionHandle` and reacts to both.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    session_events: &mut broadcast::Receiver<SessionEvent>,
-    submit_tx: mpsc::UnboundedSender<String>,
-    disconnect_tx: mpsc::UnboundedSender<()>,
+    session_events: &mut mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
+    submit_tx: mpsc::UnboundedSender<(SessionId, String)>,
+    disconnect_tx: mpsc::UnboundedSender<SessionId>,
 ) -> std::io::Result<()> {
     let theme = Theme::dark();
     let mut key_events = spawn_input_thread(Duration::from_millis(100));
@@ -340,9 +450,8 @@ pub async fn run<B: Backend>(
             }
             event = session_events.recv() => {
                 match event {
-                    Ok(event) => app.apply_session_event(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Some((id, event)) => app.apply_session_event(id, event),
+                    None => return Ok(()), // every session's forwarder task ended
                 }
             }
         }
@@ -358,17 +467,19 @@ pub async fn run<B: Backend>(
 fn handle_key_event(
     app: &mut App,
     key: KeyEvent,
-    submit_tx: &mpsc::UnboundedSender<String>,
-    disconnect_tx: &mpsc::UnboundedSender<()>,
+    submit_tx: &mpsc::UnboundedSender<(SessionId, String)>,
+    disconnect_tx: &mpsc::UnboundedSender<SessionId>,
 ) -> bool {
     app.on_key(key);
-    if let Some(line) = app.take_pending_submit() {
-        app.push_history(line.clone());
-        let _ = submit_tx.send(line);
+    let session = app.active_session_mut();
+    let id = session.id;
+    if let Some(line) = session.take_pending_submit() {
+        session.push_history(line.clone());
+        let _ = submit_tx.send((id, line));
     }
-    if app.disconnect_requested {
-        app.disconnect_requested = false;
-        let _ = disconnect_tx.send(());
+    if session.disconnect_requested {
+        session.disconnect_requested = false;
+        let _ = disconnect_tx.send(id);
     }
     app.should_quit
 }
@@ -384,11 +495,11 @@ mod tests {
 
     #[test]
     fn ctrl_c_while_connected_sends_on_disconnect_tx_not_just_the_app_flag() {
-        // Regression test: an earlier version set App::disconnect_requested
+        // Regression test: an earlier version set Session::disconnect_requested
         // but nothing downstream ever consumed it, so Ctrl+C while
         // connected did nothing observable outside the App struct.
         let mut app = App::new();
-        app.connection_state = ConnectionState::Connected;
+        app.active_session_mut().connection_state = ConnectionState::Connected;
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, mut disconnect_rx) = mpsc::unbounded_channel();
 
@@ -401,7 +512,7 @@ mod tests {
 
         assert!(!should_stop);
         assert!(
-            !app.disconnect_requested,
+            !app.active_session().disconnect_requested,
             "flag should be cleared once forwarded"
         );
         assert!(
@@ -413,7 +524,7 @@ mod tests {
     #[test]
     fn enter_forwards_submitted_line_through_handle_key_event() {
         let mut app = App::new();
-        app.input = "show version".to_string();
+        app.active_session_mut().input = "show version".to_string();
         let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
 
@@ -424,7 +535,10 @@ mod tests {
             &disconnect_tx,
         );
 
-        assert_eq!(submit_rx.try_recv().ok(), Some("show version".to_string()));
+        assert_eq!(
+            submit_rx.try_recv().ok(),
+            Some((SessionId::new(0), "show version".to_string()))
+        );
     }
 
     #[test]
@@ -432,9 +546,9 @@ mod tests {
         let mut app = App::new();
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char('h')));
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char('i')));
-        assert_eq!(app.input, "hi");
+        assert_eq!(app.active_session().input, "hi");
         app.on_key(key(KeyModifiers::NONE, KeyCode::Backspace));
-        assert_eq!(app.input, "h");
+        assert_eq!(app.active_session().input, "h");
     }
 
     #[test]
@@ -444,92 +558,191 @@ mod tests {
             app.on_key(key(KeyModifiers::NONE, KeyCode::Char(c)));
         }
         app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
-        assert_eq!(app.input, "");
-        assert_eq!(app.take_pending_submit(), Some("show version".to_string()));
-        assert_eq!(app.take_pending_submit(), None);
+        assert_eq!(app.active_session().input, "");
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            Some("show version".to_string())
+        );
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
     }
 
     #[test]
     fn enter_on_empty_input_does_not_submit() {
         let mut app = App::new();
         app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
-        assert_eq!(app.take_pending_submit(), None);
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
     }
 
     #[test]
     fn ctrl_l_clears_console_scrollback() {
         let mut app = App::new();
-        app.push_line("some output".to_string());
+        app.active_session_mut()
+            .push_line("some output".to_string());
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('l')));
-        assert!(app.scrollback.is_empty());
+        assert!(app.active_session().scrollback.is_empty());
     }
 
     #[test]
     fn ctrl_c_requests_disconnect_when_connected() {
         let mut app = App::new();
-        app.connection_state = ConnectionState::Connected;
+        app.active_session_mut().connection_state = ConnectionState::Connected;
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
-        assert!(app.disconnect_requested);
+        assert!(app.active_session().disconnect_requested);
         assert!(!app.should_quit);
     }
 
     #[test]
     fn ctrl_c_quits_when_already_disconnected() {
         let mut app = App::new();
-        assert_eq!(app.connection_state, ConnectionState::Disconnected);
+        assert_eq!(
+            app.active_session().connection_state,
+            ConnectionState::Disconnected
+        );
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
         assert!(app.should_quit);
     }
 
     #[test]
-    fn unimplemented_keys_set_a_visible_hint_instead_of_being_silently_dropped() {
+    fn ctrl_c_on_disconnected_tab_does_not_quit_while_another_tab_is_still_up() {
+        let mut app = App::with_session_count(2);
+        app.sessions[1].connection_state = ConnectionState::Connected;
+        assert_eq!(app.active, 0);
+        assert_eq!(
+            app.active_session().connection_state,
+            ConnectionState::Disconnected
+        );
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+
+        assert!(
+            !app.should_quit,
+            "another session is still up -- Ctrl+C on this already-disconnected \
+             tab must not tear down the whole app"
+        );
+        assert!(!app.active_session().disconnect_requested);
+    }
+
+    #[test]
+    fn ctrl_n_cycles_the_active_session_and_wraps_around() {
+        let mut app = App::with_session_count(3);
+        assert_eq!(app.active, 0);
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('n')));
+        assert_eq!(app.active, 1);
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('n')));
+        assert_eq!(app.active, 2);
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('n')));
+        assert_eq!(app.active, 0, "should wrap back to the first tab");
+    }
+
+    #[test]
+    fn ctrl_n_with_a_single_session_shows_a_hint_instead_of_a_no_op() {
         let mut app = App::new();
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('n')));
-        assert_eq!(app.hint.as_deref(), Some("Ctrl+N: not yet implemented"));
+        assert_eq!(app.active, 0);
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("Ctrl+N: only one session")
+        );
+    }
+
+    #[test]
+    fn each_session_gets_a_distinct_stable_session_id() {
+        let app = App::with_session_count(3);
+        assert_eq!(app.sessions[0].id, SessionId::new(0));
+        assert_eq!(app.sessions[1].id, SessionId::new(1));
+        assert_eq!(app.sessions[2].id, SessionId::new(2));
+    }
+
+    #[test]
+    fn apply_session_event_routes_to_the_matching_session_only() {
+        let mut app = App::with_session_count(2);
+        app.apply_session_event(
+            SessionId::new(1),
+            SessionEvent::RawLine("only for session 1".to_string()),
+        );
+        assert!(app.sessions[0].scrollback.is_empty());
+        assert_eq!(
+            app.sessions[1].scrollback.back().map(String::as_str),
+            Some("only for session 1")
+        );
+    }
+
+    #[test]
+    fn unimplemented_keys_set_a_visible_hint_instead_of_being_silently_dropped() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("Ctrl+P: not yet implemented")
+        );
 
         app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
-        assert_eq!(app.hint.as_deref(), Some("TAB: not yet implemented"));
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("TAB: not yet implemented")
+        );
 
         app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
-        assert_eq!(app.hint.as_deref(), Some("ESC: not yet implemented"));
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("ESC: not yet implemented")
+        );
     }
 
     #[test]
     fn raw_line_session_events_append_to_scrollback() {
         let mut app = App::new();
-        app.apply_session_event(SessionEvent::RawLine("Switch> ".to_string()));
-        assert_eq!(app.scrollback.back().map(String::as_str), Some("Switch> "));
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::RawLine("Switch> ".to_string()),
+        );
+        assert_eq!(
+            app.active_session().scrollback.back().map(String::as_str),
+            Some("Switch> ")
+        );
     }
 
     #[test]
     fn connection_state_changed_event_updates_header_state() {
         let mut app = App::new();
-        app.apply_session_event(SessionEvent::ConnectionStateChanged(
-            ConnectionState::Connected,
-        ));
-        assert_eq!(app.connection_state, ConnectionState::Connected);
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Connected),
+        );
+        assert_eq!(
+            app.active_session().connection_state,
+            ConnectionState::Connected
+        );
     }
 
     #[test]
     fn scrollback_is_bounded() {
         let mut app = App::new();
         for i in 0..(MAX_SCROLLBACK_LINES + 10) {
-            app.push_line(format!("line {i}"));
+            app.active_session_mut().push_line(format!("line {i}"));
         }
-        assert_eq!(app.scrollback.len(), MAX_SCROLLBACK_LINES);
-        assert_eq!(app.scrollback.front().map(String::as_str), Some("line 10"));
+        assert_eq!(app.active_session().scrollback.len(), MAX_SCROLLBACK_LINES);
+        assert_eq!(
+            app.active_session().scrollback.front().map(String::as_str),
+            Some("line 10")
+        );
     }
 
     #[test]
     fn vendor_status_starts_pending_and_updates_on_detection_event() {
         let mut app = App::new();
-        assert_eq!(app.vendor_status, None, "no event yet -> pending");
-
-        app.apply_session_event(SessionEvent::VendorDetection(
-            VendorDetectionStatus::Unknown,
-        ));
         assert_eq!(
-            app.vendor_status,
+            app.active_session().vendor_status,
+            None,
+            "no event yet -> pending"
+        );
+
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::VendorDetection(VendorDetectionStatus::Unknown),
+        );
+        assert_eq!(
+            app.active_session().vendor_status,
             Some(VendorDetectionStatus::Unknown),
             "Unknown must be a distinct, visible state from pending"
         );
@@ -540,28 +753,32 @@ mod tests {
         use ttyt_core::PromptMode;
 
         let mut app = App::new();
-        assert_eq!(app.prompt, None);
+        assert_eq!(app.active_session().prompt, None);
 
         let prompt = PromptInfo {
             hostname: "Switch".to_string(),
             mode: PromptMode::Privileged,
             privilege: Some(15),
         };
-        app.apply_session_event(SessionEvent::PromptChanged(prompt.clone()));
-        assert_eq!(app.prompt, Some(prompt));
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PromptChanged(prompt.clone()),
+        );
+        assert_eq!(app.active_session().prompt, Some(prompt));
     }
 
     #[test]
     fn parsed_events_accumulate_and_are_bounded() {
         let mut app = App::new();
         for i in 0..(MAX_PARSED_EVENTS + 5) {
-            app.apply_session_event(SessionEvent::Parsed(ParsedEvent::Warning(format!(
-                "warn {i}"
-            ))));
+            app.apply_session_event(
+                SessionId::new(0),
+                SessionEvent::Parsed(ParsedEvent::Warning(format!("warn {i}"))),
+            );
         }
-        assert_eq!(app.events.len(), MAX_PARSED_EVENTS);
+        assert_eq!(app.active_session().events.len(), MAX_PARSED_EVENTS);
         assert_eq!(
-            app.events.front(),
+            app.active_session().events.front(),
             Some(&ParsedEvent::Warning("warn 5".to_string()))
         );
     }
@@ -569,13 +786,14 @@ mod tests {
     #[test]
     fn ctrl_r_enters_search_and_shows_most_recent_match_with_empty_query() {
         let mut app = App::new();
-        app.history = vec!["show version".to_string(), "show ip int brief".to_string()];
+        app.active_session_mut().history =
+            vec!["show version".to_string(), "show ip int brief".to_string()];
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
 
-        assert!(app.history_search.is_some());
+        assert!(app.active_session().is_history_search_active());
         assert_eq!(
-            app.input_line_display(),
+            app.active_session().input_line_display(),
             "(reverse-i-search)`': show ip int brief"
         );
     }
@@ -583,7 +801,8 @@ mod tests {
     #[test]
     fn typing_in_search_mode_filters_query_not_the_input_line() {
         let mut app = App::new();
-        app.history = vec!["show version".to_string(), "show ip int brief".to_string()];
+        app.active_session_mut().history =
+            vec!["show version".to_string(), "show ip int brief".to_string()];
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char('v')));
@@ -591,11 +810,12 @@ mod tests {
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char('r')));
 
         assert_eq!(
-            app.input, "",
+            app.active_session().input,
+            "",
             "typed chars must not leak into input while searching"
         );
         assert_eq!(
-            app.input_line_display(),
+            app.active_session().input_line_display(),
             "(reverse-i-search)`ver': show version"
         );
     }
@@ -603,20 +823,20 @@ mod tests {
     #[test]
     fn repeated_ctrl_r_cycles_to_next_older_match() {
         let mut app = App::new();
-        app.history = vec![
+        app.active_session_mut().history = vec![
             "show version".to_string(),
             "show version detail".to_string(),
         ];
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         assert_eq!(
-            app.input_line_display(),
+            app.active_session().input_line_display(),
             "(reverse-i-search)`': show version detail"
         );
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         assert_eq!(
-            app.input_line_display(),
+            app.active_session().input_line_display(),
             "(reverse-i-search)`': show version"
         );
     }
@@ -624,15 +844,18 @@ mod tests {
     #[test]
     fn enter_accepts_match_into_input_without_auto_submitting() {
         let mut app = App::new();
-        app.history = vec!["show version".to_string()];
+        app.active_session_mut().history = vec!["show version".to_string()];
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
 
-        assert!(app.history_search.is_none(), "search mode should end");
-        assert_eq!(app.input, "show version");
+        assert!(
+            !app.active_session().is_history_search_active(),
+            "search mode should end"
+        );
+        assert_eq!(app.active_session().input, "show version");
         assert_eq!(
-            app.take_pending_submit(),
+            app.active_session_mut().take_pending_submit(),
             None,
             "accepting a match must never auto-submit it"
         );
@@ -641,20 +864,20 @@ mod tests {
     #[test]
     fn esc_cancels_search_without_touching_input() {
         let mut app = App::new();
-        app.history = vec!["show version".to_string()];
-        app.input = "unrelated".to_string();
+        app.active_session_mut().history = vec!["show version".to_string()];
+        app.active_session_mut().input = "unrelated".to_string();
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
 
-        assert!(app.history_search.is_none());
-        assert_eq!(app.input, "unrelated");
+        assert!(!app.active_session().is_history_search_active());
+        assert_eq!(app.active_session().input, "unrelated");
     }
 
     #[test]
     fn submitted_command_is_appended_to_history_via_handle_key_event() {
         let mut app = App::new();
-        app.input = "show version".to_string();
+        app.active_session_mut().input = "show version".to_string();
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
 
@@ -665,7 +888,10 @@ mod tests {
             &disconnect_tx,
         );
 
-        assert_eq!(app.history, vec!["show version".to_string()]);
+        assert_eq!(
+            app.active_session().history,
+            vec!["show version".to_string()]
+        );
     }
 
     #[test]
@@ -677,12 +903,15 @@ mod tests {
         // matches every other "not applicable right now" key, which shows
         // a hint instead of a stuck UI state.
         let mut app = App::new();
-        assert!(app.history.is_empty());
+        assert!(app.active_session().history.is_empty());
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
 
-        assert!(app.history_search.is_none());
-        assert_eq!(app.hint.as_deref(), Some("Ctrl+R: no command history yet"));
+        assert!(!app.active_session().is_history_search_active());
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("Ctrl+R: no command history yet")
+        );
     }
 
     #[test]
@@ -694,32 +923,35 @@ mod tests {
         // Ctrl+C -- the app's only disconnect/quit path -- unreachable
         // for as long as history search was open.
         let mut app = App::new();
-        app.history = vec!["show version".to_string()];
-        app.connection_state = ConnectionState::Connected;
+        app.active_session_mut().history = vec!["show version".to_string()];
+        app.active_session_mut().connection_state = ConnectionState::Connected;
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
-        assert!(app.history_search.is_some());
+        assert!(app.active_session().is_history_search_active());
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
 
         assert!(
-            app.history_search.is_none(),
+            !app.active_session().is_history_search_active(),
             "Ctrl+C must cancel search, not type 'c' into the query"
         );
-        assert!(app.disconnect_requested);
+        assert!(app.active_session().disconnect_requested);
         assert!(!app.should_quit);
     }
 
     #[test]
     fn ctrl_c_while_disconnected_quits_even_if_history_search_is_active() {
         let mut app = App::new();
-        app.history = vec!["show version".to_string()];
-        assert_eq!(app.connection_state, ConnectionState::Disconnected);
+        app.active_session_mut().history = vec!["show version".to_string()];
+        assert_eq!(
+            app.active_session().connection_state,
+            ConnectionState::Disconnected
+        );
 
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
 
-        assert!(app.history_search.is_none());
+        assert!(!app.active_session().is_history_search_active());
         assert!(app.should_quit);
     }
 
@@ -730,9 +962,12 @@ mod tests {
         // all explicitly capped.
         let mut app = App::new();
         for i in 0..(MAX_HISTORY_ENTRIES + 10) {
-            app.push_history(format!("cmd {i}"));
+            app.active_session_mut().push_history(format!("cmd {i}"));
         }
-        assert_eq!(app.history.len(), MAX_HISTORY_ENTRIES);
-        assert_eq!(app.history.first().map(String::as_str), Some("cmd 10"));
+        assert_eq!(app.active_session().history.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(
+            app.active_session().history.first().map(String::as_str),
+            Some("cmd 10")
+        );
     }
 }

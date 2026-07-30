@@ -83,8 +83,9 @@ mod tests {
     #[test]
     fn scrollback_content_and_input_line_are_visible_in_console_pane() {
         let mut app = App::new();
-        app.push_line("Switch> show version".to_string());
-        app.input = "show ip int brief".to_string();
+        app.active_session_mut()
+            .push_line("Switch> show version".to_string());
+        app.active_session_mut().input = "show ip int brief".to_string();
         let rendered = render_to_string(&app);
         assert!(rendered.contains("Switchshowversion") || rendered.contains("Switch"));
         assert!(rendered.contains("showipintbrief") || rendered.contains("show"));
@@ -100,7 +101,7 @@ mod tests {
     #[test]
     fn active_hint_replaces_the_keybinding_legend() {
         let mut app = App::new();
-        app.hint = Some("Ctrl+N: not yet implemented".to_string());
+        app.active_session_mut().hint = Some("Ctrl+N: not yet implemented".to_string());
         let rendered = render_to_string(&app);
         assert!(rendered.contains("notyetimplemented") || rendered.contains("implemented"));
     }

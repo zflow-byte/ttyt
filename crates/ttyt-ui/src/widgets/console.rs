@@ -18,17 +18,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Positi
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let session = app.active_session();
+
     // Reserve the last inner row for the input line.
     let scrollback_rows = inner.height.saturating_sub(1) as usize;
-    let visible_start = app.scrollback.len().saturating_sub(scrollback_rows);
-    let mut lines: Vec<Line> = app
+    let visible_start = session.scrollback.len().saturating_sub(scrollback_rows);
+    let mut lines: Vec<Line> = session
         .scrollback
         .iter()
         .skip(visible_start)
         .map(|line| Line::from(line.as_str()))
         .collect();
 
-    let prompt = app.input_line_display();
+    let prompt = session.input_line_display();
     lines.push(Line::from(prompt.clone()).style(Style::default().fg(theme.accent)));
 
     let paragraph = Paragraph::new(lines).style(Style::default().fg(theme.foreground));

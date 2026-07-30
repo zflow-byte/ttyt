@@ -9,17 +9,18 @@ use crate::app::App;
 use crate::theme::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let session = app.active_session();
     let line = Line::from(format!(
         " {conn:?}  |  Port: {port}  |  Vendor: {vendor}  |  Hostname: {hostname}  |  Mode: {mode}  |  Rec: {rec}",
-        conn = app.connection_state,
-        port = app.port_name.as_deref().unwrap_or("-"),
-        vendor = vendor_label(&app.vendor_status),
-        hostname = app.prompt.as_ref().map_or("-", |p| p.hostname.as_str()),
-        mode = app
+        conn = session.connection_state,
+        port = session.port_name.as_deref().unwrap_or("-"),
+        vendor = vendor_label(&session.vendor_status),
+        hostname = session.prompt.as_ref().map_or("-", |p| p.hostname.as_str()),
+        mode = session
             .prompt
             .as_ref()
             .map_or("-".to_string(), |p| mode_label(&p.mode)),
-        rec = if app.recording_path.is_some() {
+        rec = if session.recording_path.is_some() {
             "●"
         } else {
             "-"
@@ -40,7 +41,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 /// `None` = detection still in progress (within the banner window);
 /// `Some(Unknown)` = the window was exhausted with no match -- shown
 /// distinctly so "still waiting" and "gave up" never look the same.
-fn vendor_label(status: &Option<VendorDetectionStatus>) -> String {
+/// `pub(crate)` since `left_panel`'s tab bar shows the same label per tab.
+pub(crate) fn vendor_label(status: &Option<VendorDetectionStatus>) -> String {
     match status {
         None => "-".to_string(),
         Some(VendorDetectionStatus::Unknown) => "Unknown".to_string(),
