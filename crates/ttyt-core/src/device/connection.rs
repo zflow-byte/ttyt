@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +53,7 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 pub struct ConnectionHandle {
     transport: Arc<Mutex<Box<dyn SerialTransport>>>,
     stop: Arc<AtomicBool>,
+    write_pending: Arc<AtomicUsize>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -67,16 +68,25 @@ impl ConnectionHandle {
     {
         let transport = Arc::new(Mutex::new(transport));
         let stop = Arc::new(AtomicBool::new(false));
+        let write_pending = Arc::new(AtomicUsize::new(0));
 
         let thread_transport = Arc::clone(&transport);
         let thread_stop = Arc::clone(&stop);
+        let thread_write_pending = Arc::clone(&write_pending);
         let reader_thread = std::thread::spawn(move || {
-            reader_loop(&thread_transport, &thread_stop, &bus, &reopen);
+            reader_loop(
+                &thread_transport,
+                &thread_stop,
+                &thread_write_pending,
+                &bus,
+                &reopen,
+            );
         });
 
         ConnectionHandle {
             transport,
             stop,
+            write_pending,
             reader_thread: Some(reader_thread),
         }
     }
@@ -84,16 +94,30 @@ impl ConnectionHandle {
     /// Write a line to the device (a trailing `\n` is appended). Runs on
     /// `spawn_blocking` so the async runtime is never blocked on serial
     /// I/O; must be called from within a Tokio runtime context.
+    ///
+    /// `write_pending` is incremented before the lock is requested and
+    /// decremented once the write completes, so `reader_loop` knows to
+    /// yield the transport lock rather than immediately re-acquiring it
+    /// after every read -- without this, a reader thread holding the lock
+    /// for a full read-timeout cycle on every iteration (the common case on
+    /// a quiet device) can starve a waiting writer indefinitely under an
+    /// unfair mutex (observed: multi-second to 78s waits in testing).
     pub async fn write_line(&self, line: &str) -> Result<(), CoreError> {
         let transport = Arc::clone(&self.transport);
+        let write_pending = Arc::clone(&self.write_pending);
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = transport
-                .lock()
-                .map_err(|_| CoreError::Config("serial transport lock poisoned".to_string()))?;
-            guard.write_all(&bytes).map_err(CoreError::Io)
+            write_pending.fetch_add(1, Ordering::SeqCst);
+            let result = (|| {
+                let mut guard = transport
+                    .lock()
+                    .map_err(|_| CoreError::Config("serial transport lock poisoned".to_string()))?;
+                guard.write_all(&bytes).map_err(CoreError::Io)
+            })();
+            write_pending.fetch_sub(1, Ordering::SeqCst);
+            result
         })
         .await
         .map_err(|e| CoreError::Config(format!("write task panicked: {e}")))?
@@ -114,9 +138,16 @@ impl Drop for ConnectionHandle {
     }
 }
 
+/// How long to yield the transport lock for when a writer is waiting.
+/// Small relative to the read timeout so it doesn't meaningfully delay
+/// processing device output, but enough to reliably lose the next lock
+/// race to a writer that is already blocked on `Mutex::lock`.
+const WRITER_YIELD: Duration = Duration::from_millis(2);
+
 fn reader_loop<F>(
     transport: &Arc<Mutex<Box<dyn SerialTransport>>>,
     stop: &Arc<AtomicBool>,
+    write_pending: &Arc<AtomicUsize>,
     bus: &Arc<EventBus>,
     reopen: &F,
 ) where
@@ -138,6 +169,13 @@ fn reader_loop<F>(
             };
             guard.read(&mut buf)
         };
+        // Lock released above (guard out of scope) before this check --
+        // sleeping here, not inside the guard's scope, is what actually
+        // gives a waiting writer a window to win the next lock race. See
+        // `ConnectionHandle::write_line`'s doc comment for why this exists.
+        if write_pending.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(WRITER_YIELD);
+        }
 
         match read_result {
             Ok(0) => consecutive_errors += 1,
@@ -236,6 +274,12 @@ mod tests {
     struct MockTransport {
         reads: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
         writes_tx: mpsc::Sender<Vec<u8>>,
+        /// How long a read blocks once the queue is exhausted, simulating
+        /// an idle port's read-timeout cycle. Existing tests use a short
+        /// value to stay fast; the writer-starvation regression test below
+        /// uses `open_serial_transport`'s real 200ms to reproduce the
+        /// duty-cycle conditions that actually triggered the bug.
+        idle_sleep: Duration,
     }
 
     impl SerialTransport for MockTransport {
@@ -250,7 +294,7 @@ mod tests {
                 None => {
                     // Queue exhausted: behave like an idle port timing out
                     // forever so the reader thread just polls quietly.
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(self.idle_sleep);
                     Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "idle"))
                 }
             }
@@ -272,6 +316,7 @@ mod tests {
         let transport = MockTransport {
             reads: std::collections::VecDeque::from([Ok(b"Switch> \r\n".to_vec())]),
             writes_tx,
+            idle_sleep: Duration::from_millis(5),
         };
         let bus = Arc::new(EventBus::new(16));
         let mut sub = bus.subscribe();
@@ -299,6 +344,7 @@ mod tests {
         let transport = MockTransport {
             reads: std::collections::VecDeque::new(),
             writes_tx,
+            idle_sleep: Duration::from_millis(5),
         };
         let bus = Arc::new(EventBus::new(16));
 
@@ -316,12 +362,57 @@ mod tests {
         handle.disconnect();
     }
 
+    /// Regression test for a real latency bug: the reader thread holds the
+    /// transport mutex for the entire duration of each read (bounded by the
+    /// port's read timeout -- 200ms on a real device, matched here), then
+    /// releases and immediately re-locks for the next iteration. On an idle
+    /// port that's a near-100% duty cycle, and under macOS's unfair
+    /// `os_unfair_lock` a `write_line` call competing for the same mutex
+    /// was observed to starve for anywhere from several seconds to 78s
+    /// waiting for a lock window that the reader kept winning first. Uses a
+    /// real 200ms idle cycle (not the 5ms used by other tests here) to
+    /// reproduce the duty cycle that actually triggered it.
+    #[tokio::test]
+    async fn write_line_is_not_starved_by_a_busy_reader_on_an_idle_port() {
+        let (writes_tx, writes_rx) = mpsc::channel();
+        let transport = MockTransport {
+            reads: std::collections::VecDeque::new(),
+            writes_tx,
+            idle_sleep: Duration::from_millis(200),
+        };
+        let bus = Arc::new(EventBus::new(16));
+
+        let mut handle = ConnectionHandle::spawn(Box::new(transport), bus, || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        // Let the reader thread settle into its idle read-timeout cycle
+        // before racing a write against it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        handle.write_line("show version").await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write_line took {elapsed:?} against an idle 200ms-cycle reader -- \
+             should bound to roughly one read cycle, not be starved indefinitely"
+        );
+
+        writes_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write should have been forwarded to the transport");
+
+        handle.disconnect();
+    }
+
     #[tokio::test]
     async fn repeated_broken_pipe_triggers_disconnect_then_reconnect() {
         let (writes_tx, _writes_rx) = mpsc::channel();
         let transport = MockTransport {
             reads: std::collections::VecDeque::from([broken_pipe(), broken_pipe(), broken_pipe()]),
             writes_tx: writes_tx.clone(),
+            idle_sleep: Duration::from_millis(5),
         };
         let bus = Arc::new(EventBus::new(16));
         let mut sub = bus.subscribe();
@@ -334,6 +425,7 @@ mod tests {
                 Ok(Box::new(MockTransport {
                     reads: std::collections::VecDeque::new(),
                     writes_tx: writes_tx.clone(),
+                    idle_sleep: Duration::from_millis(5),
                 }) as Box<dyn SerialTransport>)
             });
 
@@ -372,6 +464,7 @@ mod tests {
         let transport = MockTransport {
             reads: std::collections::VecDeque::new(),
             writes_tx,
+            idle_sleep: Duration::from_millis(5),
         };
         let bus = Arc::new(EventBus::new(16));
 

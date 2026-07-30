@@ -248,10 +248,21 @@ mod tests {
         use ttyt_core::device::SerialTransport;
         use ttyt_core::{CoreError, EventBus, SessionEvent};
 
-        let (mut controller_a, device_a) =
+        let (mut controller_a, mut device_a) =
             serialport::TTYPort::pair().expect("failed to allocate PTY pair A");
-        let (controller_b, device_b) =
+        let (controller_b, mut device_b) =
             serialport::TTYPort::pair().expect("failed to allocate PTY pair B");
+        // Without a read timeout, the reader thread's blocking `read()` can
+        // sit forever with no data pending, so `disconnect()`'s thread-join
+        // waits indefinitely -- this is what made this test's wall time
+        // vary wildly (single-digit to 45+ seconds) across runs. Mirrors
+        // `open_serial_transport`'s real-device timeout.
+        device_a
+            .set_timeout(Duration::from_millis(200))
+            .expect("set_timeout should succeed on PTY device side A");
+        device_b
+            .set_timeout(Duration::from_millis(200))
+            .expect("set_timeout should succeed on PTY device side B");
         let device_a: Box<dyn serialport::SerialPort> = Box::new(device_a);
         let device_a: Box<dyn SerialTransport> = Box::new(device_a);
         let device_b: Box<dyn serialport::SerialPort> = Box::new(device_b);
