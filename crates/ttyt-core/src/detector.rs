@@ -81,7 +81,9 @@ impl Detector {
                             )));
                         }
                         self.last_hostname = Some(prompt.hostname.clone());
+                        let suggestions = plugin.suggestions(&prompt);
                         bus.publish(SessionEvent::PromptChanged(prompt));
+                        bus.publish(SessionEvent::Suggestions(suggestions));
                     }
                     for event in plugin.parse_output(line) {
                         bus.publish(SessionEvent::Parsed(event));
@@ -110,7 +112,8 @@ pub async fn run(
             }
             Ok(SessionEvent::VendorDetection(_))
             | Ok(SessionEvent::PromptChanged(_))
-            | Ok(SessionEvent::Parsed(_)) => {
+            | Ok(SessionEvent::Parsed(_))
+            | Ok(SessionEvent::Suggestions(_)) => {
                 // The detector's own output, echoed back on the same
                 // bus it publishes to -- not re-processed as input.
             }
@@ -209,6 +212,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_changed_is_followed_by_suggestions_for_the_same_mode() {
+        let bus = Arc::new(EventBus::new(64));
+        let mut sub = detected_result(&bus);
+        let mut detector = Detector::new(PluginRegistry::with_default_plugins());
+
+        detector.handle_raw_line("Cisco IOS Software, Version 15.2(2)E7", &bus);
+        sub.recv().await.unwrap(); // VendorDetection
+
+        detector.handle_raw_line("Switch>", &bus);
+        assert!(matches!(
+            sub.recv().await.unwrap(),
+            SessionEvent::PromptChanged(_)
+        ));
+        match sub.recv().await.unwrap() {
+            SessionEvent::Suggestions(suggestions) => {
+                assert!(!suggestions.is_empty());
+            }
+            other => panic!("expected Suggestions right after PromptChanged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn hostname_change_across_prompts_publishes_hostname_changed() {
         let bus = Arc::new(EventBus::new(64));
         let mut sub = detected_result(&bus);
@@ -219,6 +244,7 @@ mod tests {
 
         detector.handle_raw_line("Switch>", &bus);
         sub.recv().await.unwrap(); // PromptChanged (Switch)
+        sub.recv().await.unwrap(); // Suggestions
 
         detector.handle_raw_line("core-sw-01>", &bus);
         let event = sub.recv().await.unwrap();
@@ -244,6 +270,7 @@ mod tests {
 
         detector.handle_raw_line("Switch>", &bus);
         sub.recv().await.unwrap(); // PromptChanged
+        sub.recv().await.unwrap(); // Suggestions
 
         detector.handle_raw_line("Switch#", &bus);
         // Same hostname, different mode -- PromptChanged again, but no

@@ -119,13 +119,17 @@ pub async fn run(
             }
             Ok(SessionEvent::VendorDetection(_))
             | Ok(SessionEvent::PromptChanged(_))
-            | Ok(SessionEvent::Parsed(_)) => {
+            | Ok(SessionEvent::Parsed(_))
+            | Ok(SessionEvent::Suggestions(_)) => {
                 // Deliberately not recorded: these are all derived from
                 // RawLine events that are already in the transcript, so
                 // recording them too would duplicate every line they were
                 // derived from. Listed explicitly (not a wildcard arm) so
                 // adding a future SessionEvent variant forces a decision
                 // here instead of silently falling through either way.
+                // (Suggestions specifically: it's TAB-autocomplete
+                // candidates for the *current* prompt, not device output
+                // -- there is nothing to transcribe.)
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(

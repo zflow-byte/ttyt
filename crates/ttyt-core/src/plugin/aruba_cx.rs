@@ -73,6 +73,10 @@ impl VendorPlugin for ArubaCxPlugin {
         // Cisco-like shape risks silently misclassifying real output.
         Vec::new()
     }
+
+    fn suggestions(&self, ctx: &PromptInfo) -> Vec<String> {
+        crate::plugin::common::cisco_style_suggestions(&ctx.mode)
+    }
 }
 
 /// `switch(config)#` -> Config, `switch(config-if)#` -> ConfigIf,
@@ -188,6 +192,24 @@ mod tests {
             ArubaCxPlugin
                 .parse_prompt("1/1/1 up, line protocol is up")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn suggestions_are_non_empty_and_mode_dependent() {
+        let privileged = PromptInfo {
+            hostname: "switch".to_string(),
+            mode: PromptMode::Privileged,
+            privilege: None,
+        };
+        let config = PromptInfo {
+            mode: PromptMode::Config,
+            ..privileged.clone()
+        };
+        assert!(!ArubaCxPlugin.suggestions(&privileged).is_empty());
+        assert_ne!(
+            ArubaCxPlugin.suggestions(&privileged),
+            ArubaCxPlugin.suggestions(&config)
         );
     }
 }

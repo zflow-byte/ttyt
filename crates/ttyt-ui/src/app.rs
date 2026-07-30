@@ -38,6 +38,17 @@ pub struct HistorySearchState {
     pub match_index: usize,
 }
 
+/// TAB-cycle state: `prefix` is the input text as it stood before the
+/// first TAB press, `candidates` are `Session::suggestions` filtered to
+/// those starting with it, `index` (mod the candidate count) is which one
+/// is currently inserted into `input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TabCycleState {
+    prefix: String,
+    candidates: Vec<String>,
+    index: usize,
+}
+
 /// A session's modal input state. At most one is active at a time --
 /// modeling this as one enum rather than several `Option<T>` fields makes
 /// the mutual exclusion structural instead of a convention every new
@@ -91,6 +102,18 @@ pub struct Session {
     /// searching this session's own just-typed commands is no more
     /// exposed than the scrollback already visible on screen.
     pub history: Vec<String>,
+    /// TAB-autocomplete candidates for the current prompt context,
+    /// published by the detector alongside `PromptChanged` (Task 3.3).
+    /// Empty until a `Suggestions` event arrives or nothing is offered
+    /// for this mode.
+    pub suggestions: Vec<String>,
+    /// State of an in-progress TAB-cycle (repeated TAB presses stepping
+    /// through `suggestions` that matched the prefix typed before the
+    /// first press). Not part of `Mode`: unlike history search or
+    /// confirm-send, it never intercepts a key other than TAB itself --
+    /// any other keystroke naturally invalidates it (see `on_tab`'s
+    /// "still cycling?" check) without needing to swallow that key here.
+    tab_cycle: Option<TabCycleState>,
     pub(crate) mode: Mode,
     /// Compiled `Config::dangerous_command_patterns`. Defaults to
     /// `DangerousCommandGuard::empty()` (never triggers) since this crate
@@ -119,6 +142,8 @@ impl Session {
             prompt: None,
             events: VecDeque::new(),
             history: Vec::new(),
+            suggestions: Vec::new(),
+            tab_cycle: None,
             mode: Mode::Normal,
             guard: DangerousCommandGuard::empty(),
             hint: None,
@@ -159,6 +184,15 @@ impl Session {
                 while self.events.len() > MAX_PARSED_EVENTS {
                     self.events.pop_front();
                 }
+            }
+            SessionEvent::Suggestions(suggestions) => {
+                self.suggestions = suggestions;
+                // The prompt just changed (this is always published
+                // alongside `PromptChanged`), so any TAB-cycle in
+                // progress was built from the *previous* mode's
+                // candidates -- stale now, cleared rather than left to
+                // cycle through a list that no longer matches reality.
+                self.tab_cycle = None;
             }
         }
     }
@@ -202,7 +236,7 @@ impl Session {
             (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 self.set_not_yet_implemented_hint("Ctrl+P")
             }
-            (_, KeyCode::Tab) => self.set_not_yet_implemented_hint("TAB"),
+            (_, KeyCode::Tab) => self.on_tab(),
             (_, KeyCode::Esc) => self.set_not_yet_implemented_hint("ESC"),
             (_, KeyCode::Enter) => {
                 if !self.input.is_empty() {
@@ -245,6 +279,53 @@ impl Session {
             self.pending_submit = Some(cmd);
         }
         // else: declined -- mode is already Normal, cmd is dropped.
+    }
+
+    /// TAB: completes `input` from `suggestions`, inserting into the
+    /// input line only -- it is never auto-submitted (same security
+    /// principle as `VendorPlugin::suggestions`'s own doc comment).
+    /// First press filters `suggestions` to those starting with the
+    /// current `input` and inserts the first match; a second consecutive
+    /// press (input still exactly equal to the candidate just inserted)
+    /// cycles to the next one instead of restarting the filter from
+    /// scratch. Any edit in between naturally starts a fresh cycle next
+    /// time, since `input` no longer equals `tab_cycle`'s stored
+    /// candidate -- no explicit "cancel the cycle" handling needed for
+    /// any key other than TAB itself.
+    fn on_tab(&mut self) {
+        let continuing = self
+            .tab_cycle
+            .as_ref()
+            .is_some_and(|c| c.candidates.get(c.index).map(String::as_str) == Some(&self.input));
+
+        if continuing {
+            if let Some(cycle) = self.tab_cycle.as_mut() {
+                cycle.index = (cycle.index + 1) % cycle.candidates.len();
+                self.input = cycle.candidates[cycle.index].clone();
+            }
+            return;
+        }
+
+        let prefix = self.input.clone();
+        let candidates: Vec<String> = self
+            .suggestions
+            .iter()
+            .filter(|s| s.starts_with(&prefix))
+            .cloned()
+            .collect();
+
+        if candidates.is_empty() {
+            self.hint = Some("TAB: no matching suggestions".to_string());
+            self.tab_cycle = None;
+            return;
+        }
+
+        self.input = candidates[0].clone();
+        self.tab_cycle = Some(TabCycleState {
+            prefix,
+            candidates,
+            index: 0,
+        });
     }
 
     /// Enters history search on the first Ctrl+R; cycles to the next
@@ -752,17 +833,136 @@ mod tests {
             Some("Ctrl+P: not yet implemented")
         );
 
-        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
-        assert_eq!(
-            app.active_session().hint.as_deref(),
-            Some("TAB: not yet implemented")
-        );
-
         app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
         assert_eq!(
             app.active_session().hint.as_deref(),
             Some("ESC: not yet implemented")
         );
+    }
+
+    #[test]
+    fn tab_with_no_suggestions_shows_a_hint_instead_of_a_no_op() {
+        let mut app = App::new();
+        assert!(app.active_session().suggestions.is_empty());
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("TAB: no matching suggestions")
+        );
+        assert_eq!(app.active_session().input, "");
+    }
+
+    #[test]
+    fn tab_completes_from_the_typed_prefix() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions =
+            vec!["show version".to_string(), "show ip interface".to_string()];
+        app.active_session_mut().input = "show v".to_string();
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+
+        assert_eq!(app.active_session().input, "show version");
+    }
+
+    #[test]
+    fn repeated_tab_cycles_through_matching_candidates() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions =
+            vec!["show version".to_string(), "show vlan".to_string()];
+        app.active_session_mut().input = "show v".to_string();
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "show version");
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "show vlan");
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(
+            app.active_session().input,
+            "show version",
+            "should wrap back to the first candidate"
+        );
+    }
+
+    #[test]
+    fn typing_after_a_tab_completion_starts_a_fresh_cycle_next_tab() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions =
+            vec!["show version".to_string(), "show vlan".to_string()];
+        app.active_session_mut().input = "show v".to_string();
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "show version");
+
+        // Editing after the completion must not leave the old cycle
+        // active -- the next TAB should re-filter from the new input,
+        // not silently continue cycling the previous candidate list.
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('!')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(
+            app.active_session().hint.as_deref(),
+            Some("TAB: no matching suggestions")
+        );
+    }
+
+    #[test]
+    fn tab_never_auto_submits() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["show version".to_string()];
+        app.active_session_mut().input = "show".to_string();
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            None,
+            "TAB must only insert into the input line, never submit it"
+        );
+    }
+
+    #[test]
+    fn suggestions_event_replaces_the_list_and_clears_a_stale_tab_cycle() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["show version".to_string()];
+        app.active_session_mut().input = "show".to_string();
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "show version");
+
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::Suggestions(vec!["interface ".to_string()]),
+        );
+
+        assert_eq!(
+            app.active_session().suggestions,
+            vec!["interface ".to_string()]
+        );
+        // Next TAB must re-filter against the new list, not continue
+        // cycling candidates computed for the mode that just ended.
+        app.active_session_mut().input = String::new();
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "interface ");
+    }
+
+    #[test]
+    fn tab_completing_to_a_dangerous_command_then_enter_asks_for_confirmation() {
+        // Closes the loop between Task 3.4 (confirm-before-send) and
+        // Task 3.3 (autocomplete): the guard checks whatever text is in
+        // `input` when Enter is pressed, regardless of whether it was
+        // typed by hand or inserted via TAB -- plan 3.4 requires covering
+        // both, so this is asserted rather than assumed.
+        let mut app = app_with_dangerous_pattern("reload");
+        app.active_session_mut().suggestions = vec!["reload".to_string()];
+        app.active_session_mut().input = "rel".to_string();
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.active_session().input, "reload");
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+
+        assert!(app.active_session().is_confirm_send_active());
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
     }
 
     #[test]

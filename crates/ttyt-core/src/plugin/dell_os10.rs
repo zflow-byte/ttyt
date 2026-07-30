@@ -74,6 +74,10 @@ impl VendorPlugin for DellOs10Plugin {
         // output.
         Vec::new()
     }
+
+    fn suggestions(&self, ctx: &PromptInfo) -> Vec<String> {
+        crate::plugin::common::cisco_style_suggestions(&ctx.mode)
+    }
 }
 
 /// `OS10(conf)#` -> Config, `OS10(conf-if-eth1/1/1)#` -> ConfigIf,
@@ -179,6 +183,24 @@ mod tests {
             DellOs10Plugin
                 .parse_prompt("eth1/1/1 is up, line protocol is up")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn suggestions_are_non_empty_and_mode_dependent() {
+        let privileged = PromptInfo {
+            hostname: "OS10".to_string(),
+            mode: PromptMode::Privileged,
+            privilege: None,
+        };
+        let config_if = PromptInfo {
+            mode: PromptMode::ConfigIf("eth1/1/1".to_string()),
+            ..privileged.clone()
+        };
+        assert!(!DellOs10Plugin.suggestions(&privileged).is_empty());
+        assert_ne!(
+            DellOs10Plugin.suggestions(&privileged),
+            DellOs10Plugin.suggestions(&config_if)
         );
     }
 }

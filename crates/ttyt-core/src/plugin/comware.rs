@@ -97,6 +97,39 @@ impl VendorPlugin for ComwarePlugin {
             _ => Vec::new(),
         }
     }
+
+    fn suggestions(&self, ctx: &PromptInfo) -> Vec<String> {
+        // Common top-level verbs per view, not a full command tree -- see
+        // `plugin::common::cisco_style_suggestions`'s doc comment for why
+        // this doesn't need hardware-verified rigor the way parsing does.
+        match &ctx.mode {
+            PromptMode::User => vec![
+                "display current-configuration".to_string(),
+                "display version".to_string(),
+                "system-view".to_string(),
+                "quit".to_string(),
+            ],
+            PromptMode::Config => vec![
+                "interface ".to_string(),
+                "sysname ".to_string(),
+                "quit".to_string(),
+                "save".to_string(),
+            ],
+            PromptMode::ConfigIf(_) => vec![
+                "undo shutdown".to_string(),
+                "shutdown".to_string(),
+                "description ".to_string(),
+                "ip address ".to_string(),
+                "quit".to_string(),
+            ],
+            PromptMode::ConfigRouter(_) => {
+                vec!["network ".to_string(), "quit".to_string()]
+            }
+            PromptMode::Privileged | PromptMode::Other(_) => {
+                vec!["quit".to_string()]
+            }
+        }
+    }
 }
 
 /// `%%10SHELL/5/SHELL_LOGIN: ...` -> severity `5`. Splitting on `/` finds
@@ -249,6 +282,33 @@ mod tests {
         assert_eq!(
             ComwarePlugin.parse_output("GigabitEthernet1/0/1 current state: UP"),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn suggestions_use_comware_verbs_and_depend_on_mode() {
+        let user = PromptInfo {
+            hostname: "HPE".to_string(),
+            mode: PromptMode::User,
+            privilege: None,
+        };
+        let config = PromptInfo {
+            mode: PromptMode::Config,
+            ..user.clone()
+        };
+        assert!(
+            ComwarePlugin
+                .suggestions(&user)
+                .contains(&"quit".to_string())
+        );
+        assert!(
+            !ComwarePlugin
+                .suggestions(&user)
+                .contains(&"exit".to_string())
+        );
+        assert_ne!(
+            ComwarePlugin.suggestions(&user),
+            ComwarePlugin.suggestions(&config)
         );
     }
 }

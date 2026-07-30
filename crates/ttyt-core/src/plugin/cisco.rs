@@ -1,6 +1,6 @@
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode};
 use crate::plugin::VendorPlugin;
-use crate::plugin::common::extract_version_token;
+use crate::plugin::common::{cisco_style_suggestions, extract_version_token};
 
 /// Cisco IOS / IOS XE / NX-OS.
 pub struct CiscoPlugin;
@@ -84,6 +84,10 @@ impl VendorPlugin for CiscoPlugin {
         }
 
         events
+    }
+
+    fn suggestions(&self, ctx: &PromptInfo) -> Vec<String> {
+        cisco_style_suggestions(&ctx.mode)
     }
 }
 
@@ -275,12 +279,26 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_is_empty_in_phase_1() {
-        let ctx = PromptInfo {
+    fn suggestions_are_mode_dependent_and_never_empty() {
+        let privileged = PromptInfo {
             hostname: "Switch".to_string(),
             mode: PromptMode::Privileged,
             privilege: Some(15),
         };
-        assert_eq!(CiscoPlugin.suggestions(&ctx), Vec::<String>::new());
+        let config = PromptInfo {
+            mode: PromptMode::Config,
+            ..privileged.clone()
+        };
+
+        let privileged_suggestions = CiscoPlugin.suggestions(&privileged);
+        let config_suggestions = CiscoPlugin.suggestions(&config);
+
+        assert!(!privileged_suggestions.is_empty());
+        assert!(!config_suggestions.is_empty());
+        assert_ne!(
+            privileged_suggestions, config_suggestions,
+            "suggestions must depend on the current mode, not be a fixed list"
+        );
+        assert!(config_suggestions.contains(&"interface ".to_string()));
     }
 }

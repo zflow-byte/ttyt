@@ -50,6 +50,14 @@ pub enum SessionEvent {
     PromptChanged(PromptInfo),
     /// A line was classified by the detected vendor's `parse_output`.
     Parsed(ParsedEvent),
+    /// Published alongside `PromptChanged`, from the same
+    /// `VendorPlugin::suggestions` call: TAB-autocomplete candidates for
+    /// the prompt context that just became current (Task 3.3). Computed
+    /// eagerly by the detector rather than lazily by the UI so
+    /// `ttyt-ui` never needs a `PluginRegistry` -- suggestions are vendor
+    /// logic, and the design doc keeps all vendor logic in
+    /// `ttyt-core`, reached by the UI only through bus events.
+    Suggestions(Vec<String>),
 }
 
 /// A single-producer, multi-consumer fan-out for `SessionEvent`s. Every

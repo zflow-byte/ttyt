@@ -76,6 +76,32 @@ impl VendorPlugin for JunosPlugin {
         // against console output without a real device to verify against.
         Vec::new()
     }
+
+    fn suggestions(&self, ctx: &PromptInfo) -> Vec<String> {
+        // Common top-level verbs per mode, not a full command tree -- see
+        // `plugin::common::cisco_style_suggestions`'s doc comment for why
+        // this doesn't need hardware-verified rigor the way parsing does.
+        // `parse_prompt` above only ever produces User/Config for JunOS;
+        // the other `PromptMode` variants get a minimal fallback since
+        // they're unreachable in practice, not a real JunOS mode.
+        match ctx.mode {
+            PromptMode::User => vec![
+                "show version".to_string(),
+                "show interfaces terminal".to_string(),
+                "configure".to_string(),
+                "quit".to_string(),
+            ],
+            PromptMode::Config => vec![
+                "set ".to_string(),
+                "delete ".to_string(),
+                "show".to_string(),
+                "commit".to_string(),
+                "top".to_string(),
+                "exit".to_string(),
+            ],
+            _ => vec!["exit".to_string()],
+        }
+    }
 }
 
 /// JunOS's release banner puts the version right after the literal
@@ -168,6 +194,28 @@ mod tests {
         assert_eq!(
             JunosPlugin.parse_output("Jan  1 00:00:00 router1 mgd[1234]: UI_COMMIT: something"),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn suggestions_use_junos_verbs_and_depend_on_mode() {
+        let operational = PromptInfo {
+            hostname: "router1".to_string(),
+            mode: PromptMode::User,
+            privilege: None,
+        };
+        let config = PromptInfo {
+            mode: PromptMode::Config,
+            ..operational.clone()
+        };
+        assert!(
+            JunosPlugin
+                .suggestions(&config)
+                .contains(&"commit".to_string())
+        );
+        assert_ne!(
+            JunosPlugin.suggestions(&operational),
+            JunosPlugin.suggestions(&config)
         );
     }
 }
