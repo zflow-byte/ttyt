@@ -194,7 +194,19 @@ value. Every history file is created `0600`.
   one of the other markers) ever appears as literal text inside ordinary,
   non-paginated output with no trailing newline yet, ttyt will switch to
   pagination mode on a false match. `Esc` cancels back to normal input
-  without sending anything if this happens.
+  without sending anything if this happens. The other direction is worse
+  and easy to miss: the marker list (`--More--`, `---- More ----`,
+  `---(more`) was reconstructed from vendor documentation, not captured
+  from real hardware, same caveat as the Phase 2 vendor plugins below —
+  if a real device pages with a variant not in that list (older
+  ProCurve/AOS-Switch Aruba gear uses `-- MORE --, next page: Space, next
+  line: Enter, quit: Control-C`, different spacing/case than the AOS-CX
+  form above; escape-sequence decoration around the marker would also
+  break a plain substring match), that output stays invisible in the
+  buffer and the session looks hung with no explanation -- the exact
+  symptom this feature was built to fix, recurring for an unlisted
+  variant. If that happens, capture the raw bytes and add the variant to
+  `PAGINATION_MARKERS` in `crates/ttyt-core/src/events/line_assembler.rs`.
 - Vendor detection scans up to 40 lines after connect looking for a known
   banner; if none of the plugins match in that window, vendor status
   becomes `Unknown` rather than continuing to scan indefinitely. Fortinet
