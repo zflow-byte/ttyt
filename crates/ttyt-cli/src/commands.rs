@@ -92,6 +92,9 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
         tokio::sync::mpsc::unbounded_channel::<(SessionId, ttyt_core::SessionEvent)>();
 
     let mut app = ttyt_ui::App::with_session_count(ports.len());
+    app.set_dangerous_command_guard(ttyt_core::DangerousCommandGuard::new(
+        &config.dangerous_command_patterns,
+    )?);
     let mut handles: Vec<SessionHandles> = Vec::with_capacity(ports.len());
 
     for (index, port) in ports.iter().enumerate() {

@@ -17,4 +17,4 @@ pub use plugin::{
     ArubaCxPlugin, CiscoPlugin, ComwarePlugin, DellOs10Plugin, JunosPlugin, PluginRegistry,
     VendorPlugin,
 };
-pub use session::{CommandHistory, Redactor, SessionRecorder};
+pub use session::{CommandHistory, DangerousCommandGuard, Redactor, SessionRecorder};

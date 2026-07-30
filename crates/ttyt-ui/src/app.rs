@@ -6,7 +6,8 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::mpsc;
 use ttyt_core::{
-    ConnectionState, ParsedEvent, PromptInfo, SessionEvent, SessionId, VendorDetectionStatus,
+    ConnectionState, DangerousCommandGuard, ParsedEvent, PromptInfo, SessionEvent, SessionId,
+    VendorDetectionStatus,
 };
 
 use crate::theme::Theme;
@@ -50,6 +51,14 @@ pub(crate) enum Mode {
     #[default]
     Normal,
     HistorySearch(HistorySearchState),
+    /// Enter was pressed on a line matching a `DangerousCommandGuard`
+    /// pattern; the held `String` is that line, not yet sent. Only an
+    /// explicit `y`/`Y` in `on_key_in_confirm_send` turns it into a
+    /// `pending_submit` -- every other key (including switching to a
+    /// different mode entirely, e.g. Ctrl+R) declines it. Declining never
+    /// re-enters it into `history`: history records what was actually
+    /// sent, not what was typed and abandoned.
+    ConfirmSend(String),
 }
 
 /// One connection/tab's worth of UI state. `App` owns a `Vec<Session>`;
@@ -83,6 +92,12 @@ pub struct Session {
     /// exposed than the scrollback already visible on screen.
     pub history: Vec<String>,
     pub(crate) mode: Mode,
+    /// Compiled `Config::dangerous_command_patterns`. Defaults to
+    /// `DangerousCommandGuard::empty()` (never triggers) since this crate
+    /// has no dependency on `Config` to read the real patterns from --
+    /// the caller sets the real one via `App::set_dangerous_command_guard`
+    /// once it has a `Config` in hand (see `commands.rs::connect`).
+    guard: DangerousCommandGuard,
     /// Set by keys the spec defines but this phase doesn't implement yet
     /// (Ctrl+P/TAB/ESC) — shown in the bottom-right hints pane rather than
     /// the keypress being silently swallowed.
@@ -105,6 +120,7 @@ impl Session {
             events: VecDeque::new(),
             history: Vec::new(),
             mode: Mode::Normal,
+            guard: DangerousCommandGuard::empty(),
             hint: None,
             disconnect_requested: false,
             pending_submit: None,
@@ -159,16 +175,26 @@ impl Session {
     /// Handles one key event already known to be scoped to this session
     /// (global keys -- Ctrl+C, Ctrl+N -- are intercepted by `App::on_key`
     /// before reaching here). Ctrl+R enters/cycles history search
-    /// regardless of mode; while searching, every other key is handled by
-    /// `on_key_in_history_search` instead of the normal bindings below.
+    /// regardless of mode -- including declining a pending confirm-send,
+    /// on the same principle Ctrl+C already uses: switching away from a
+    /// mode always discards it safely rather than carrying it forward.
+    /// While in a mode, every other key is handled by that mode's own
+    /// handler instead of the normal bindings below.
     fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
             self.cycle_history_search();
             return;
         }
-        if matches!(self.mode, Mode::HistorySearch(_)) {
-            self.on_key_in_history_search(key);
-            return;
+        match self.mode {
+            Mode::HistorySearch(_) => {
+                self.on_key_in_history_search(key);
+                return;
+            }
+            Mode::ConfirmSend(_) => {
+                self.on_key_in_confirm_send(key);
+                return;
+            }
+            Mode::Normal => {}
         }
 
         match (key.modifiers, key.code) {
@@ -180,7 +206,12 @@ impl Session {
             (_, KeyCode::Esc) => self.set_not_yet_implemented_hint("ESC"),
             (_, KeyCode::Enter) => {
                 if !self.input.is_empty() {
-                    self.pending_submit = Some(std::mem::take(&mut self.input));
+                    let cmd = std::mem::take(&mut self.input);
+                    if self.guard.is_dangerous(&cmd) {
+                        self.mode = Mode::ConfirmSend(cmd);
+                    } else {
+                        self.pending_submit = Some(cmd);
+                    }
                 }
             }
             (_, KeyCode::Backspace) => {
@@ -189,6 +220,21 @@ impl Session {
             (_, KeyCode::Char(c)) => self.input.push(c),
             _ => {}
         }
+    }
+
+    /// Key handling while `mode` is `ConfirmSend`: an explicit `y`/`Y` is
+    /// the only key that turns the held command into a `pending_submit`;
+    /// every other key (`n`, Esc, Enter, anything) declines it and drops
+    /// it -- there is no bypass path, and a declined command is not kept
+    /// anywhere (not re-entered into `input`, not pushed to `history`).
+    fn on_key_in_confirm_send(&mut self, key: KeyEvent) {
+        let Mode::ConfirmSend(cmd) = std::mem::take(&mut self.mode) else {
+            return;
+        };
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            self.pending_submit = Some(cmd);
+        }
+        // else: declined -- mode is already Normal, cmd is dropped.
     }
 
     /// Enters history search on the first Ctrl+R; cycles to the next
@@ -204,7 +250,9 @@ impl Session {
         }
         match &mut self.mode {
             Mode::HistorySearch(search) => search.match_index += 1,
-            Mode::Normal => self.mode = Mode::HistorySearch(HistorySearchState::default()),
+            Mode::Normal | Mode::ConfirmSend(_) => {
+                self.mode = Mode::HistorySearch(HistorySearchState::default())
+            }
         }
     }
 
@@ -260,15 +308,21 @@ impl Session {
         matches!(self.mode, Mode::HistorySearch(_))
     }
 
+    pub(crate) fn is_confirm_send_active(&self) -> bool {
+        matches!(self.mode, Mode::ConfirmSend(_))
+    }
+
     /// What the console pane's input line should display: the normal
-    /// `> {input}` prompt, or a bash-style `(reverse-i-search)` line while
-    /// history search is active.
+    /// `> {input}` prompt, a bash-style `(reverse-i-search)` line while
+    /// history search is active, or a y/N confirmation prompt while a
+    /// dangerous command awaits confirmation.
     pub fn input_line_display(&self) -> String {
         match &self.mode {
             Mode::HistorySearch(search) => {
                 let matched = self.current_history_match(search).unwrap_or("");
                 format!("(reverse-i-search)`{}': {matched}", search.query)
             }
+            Mode::ConfirmSend(cmd) => format!("Send \"{cmd}\" to the device? [y/N] "),
             Mode::Normal => format!("> {}", self.input),
         }
     }
@@ -312,6 +366,18 @@ impl App {
 
     pub fn active_session_mut(&mut self) -> &mut Session {
         &mut self.sessions[self.active]
+    }
+
+    /// Applies the real `Config::dangerous_command_patterns` guard to
+    /// every session (each gets its own clone -- cheap, see
+    /// `DangerousCommandGuard`'s doc comment). Called once by the CLI
+    /// after `Config::load()`, since this crate has no dependency on
+    /// `Config` itself. Sessions default to `DangerousCommandGuard::empty()`
+    /// until this is called.
+    pub fn set_dangerous_command_guard(&mut self, guard: DangerousCommandGuard) {
+        for session in &mut self.sessions {
+            session.guard = guard.clone();
+        }
     }
 
     /// Routes an event tagged with the `SessionId` it came from to the
@@ -968,6 +1034,121 @@ mod tests {
         assert_eq!(
             app.active_session().history.first().map(String::as_str),
             Some("cmd 10")
+        );
+    }
+
+    fn app_with_dangerous_pattern(pattern: &str) -> App {
+        let mut app = App::new();
+        app.set_dangerous_command_guard(
+            DangerousCommandGuard::new(&[pattern.to_string()]).unwrap(),
+        );
+        app
+    }
+
+    fn type_and_enter(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyModifiers::NONE, KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+    }
+
+    #[test]
+    fn enter_on_a_dangerous_command_asks_for_confirmation_instead_of_submitting() {
+        let mut app = app_with_dangerous_pattern("reload");
+        type_and_enter(&mut app, "reload");
+
+        assert!(app.active_session().is_confirm_send_active());
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            None,
+            "must not submit before confirmation"
+        );
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "Send \"reload\" to the device? [y/N] "
+        );
+    }
+
+    #[test]
+    fn y_confirms_and_submits_the_dangerous_command_exactly_once() {
+        let mut app = app_with_dangerous_pattern("reload");
+        type_and_enter(&mut app, "reload");
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('y')));
+
+        assert!(!app.active_session().is_confirm_send_active());
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            Some("reload".to_string())
+        );
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            None,
+            "must only submit once"
+        );
+    }
+
+    #[test]
+    fn any_key_other_than_y_declines_and_never_submits_or_enters_history() {
+        for declining_key in [
+            key(KeyModifiers::NONE, KeyCode::Char('n')),
+            key(KeyModifiers::NONE, KeyCode::Char('N')),
+            key(KeyModifiers::NONE, KeyCode::Esc),
+            key(KeyModifiers::NONE, KeyCode::Enter),
+        ] {
+            let mut app = app_with_dangerous_pattern("reload");
+            type_and_enter(&mut app, "reload");
+
+            app.on_key(declining_key);
+
+            assert!(!app.active_session().is_confirm_send_active());
+            assert_eq!(app.active_session_mut().take_pending_submit(), None);
+            assert!(
+                app.active_session().history.is_empty(),
+                "a declined command must not be recorded in history -- \
+                 history reflects what was actually sent, not what was typed"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_declines_a_pending_confirm_send_rather_than_bypassing_it() {
+        // "No bypass path" (Phase 3 exit criterion) means every route out
+        // of ConfirmSend must either send explicitly via 'y' or decline --
+        // never silently send. Ctrl+C already cancels every other mode on
+        // the same principle; this confirms it does so here too instead
+        // of being some kind of accidental confirm shortcut.
+        let mut app = app_with_dangerous_pattern("reload");
+        type_and_enter(&mut app, "reload");
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+
+        assert!(!app.active_session().is_confirm_send_active());
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
+    }
+
+    #[test]
+    fn ctrl_r_declines_a_pending_confirm_send_and_opens_history_search() {
+        let mut app = app_with_dangerous_pattern("reload");
+        app.active_session_mut().history = vec!["show version".to_string()];
+        type_and_enter(&mut app, "reload");
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+
+        assert!(!app.active_session().is_confirm_send_active());
+        assert!(app.active_session().is_history_search_active());
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
+    }
+
+    #[test]
+    fn non_matching_command_still_submits_immediately() {
+        let mut app = app_with_dangerous_pattern("reload");
+        type_and_enter(&mut app, "show version");
+
+        assert!(!app.active_session().is_confirm_send_active());
+        assert_eq!(
+            app.active_session_mut().take_pending_submit(),
+            Some("show version".to_string())
         );
     }
 }

@@ -11,6 +11,7 @@ use crate::theme::Theme;
 const KEYBINDING_LEGEND: &str = "Ctrl+C disconnect  Ctrl+N session  Ctrl+P palette  Ctrl+L clear  Ctrl+R history  TAB complete  ESC menu";
 const HISTORY_SEARCH_HINT: &str =
     "history search: type to filter, Ctrl+R again for older match, Enter to accept, Esc to cancel";
+const CONFIRM_SEND_HINT: &str = "dangerous command -- press 'y' to send it, any other key cancels";
 
 /// Bottom-left: parsed events (errors/warnings/link/hostname changes),
 /// most recent visible. Bottom-right: hints -- history-search usage while
@@ -29,7 +30,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(" Hints ");
-    let hints_body = if session.is_history_search_active() {
+    let hints_body = if session.is_confirm_send_active() {
+        CONFIRM_SEND_HINT
+    } else if session.is_history_search_active() {
         HISTORY_SEARCH_HINT
     } else {
         session.hint.as_deref().unwrap_or(KEYBINDING_LEGEND)
