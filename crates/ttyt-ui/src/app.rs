@@ -222,16 +222,26 @@ impl Session {
         }
     }
 
-    /// Key handling while `mode` is `ConfirmSend`: an explicit `y`/`Y` is
-    /// the only key that turns the held command into a `pending_submit`;
-    /// every other key (`n`, Esc, Enter, anything) declines it and drops
-    /// it -- there is no bypass path, and a declined command is not kept
-    /// anywhere (not re-entered into `input`, not pushed to `history`).
+    /// Key handling while `mode` is `ConfirmSend`: an explicit `y`/`Y`
+    /// press, with **no** Ctrl/Alt modifier, is the only key that turns
+    /// the held command into a `pending_submit`; every other key (`n`,
+    /// Esc, Enter, anything) declines it and drops it -- there is no
+    /// bypass path, and a declined command is not kept anywhere (not
+    /// re-entered into `input`, not pushed to `history`).
+    ///
+    /// The modifier check matters: without it, Ctrl+Y (readline's
+    /// "yank", not Ctrl+C/Ctrl+R which are already intercepted upstream)
+    /// would match `KeyCode::Char('y')` and confirm-send a dangerous
+    /// command from a keystroke a user meant as ordinary editing muscle
+    /// memory, not confirmation.
     fn on_key_in_confirm_send(&mut self, key: KeyEvent) {
         let Mode::ConfirmSend(cmd) = std::mem::take(&mut self.mode) else {
             return;
         };
-        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             self.pending_submit = Some(cmd);
         }
         // else: declined -- mode is already Normal, cmd is dropped.
@@ -1095,6 +1105,12 @@ mod tests {
             key(KeyModifiers::NONE, KeyCode::Char('N')),
             key(KeyModifiers::NONE, KeyCode::Esc),
             key(KeyModifiers::NONE, KeyCode::Enter),
+            // Regression test: Ctrl+Y (readline "yank") matches
+            // `KeyCode::Char('y')` just like a plain 'y' does, and an
+            // earlier version checked only `key.code`, so Ctrl+Y
+            // confirmed and sent the dangerous command. Only a plain
+            // (no Ctrl/Alt) 'y'/'Y' may confirm.
+            key(KeyModifiers::CONTROL, KeyCode::Char('y')),
         ] {
             let mut app = app_with_dangerous_pattern("reload");
             type_and_enter(&mut app, "reload");
