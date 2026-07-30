@@ -406,3 +406,69 @@ Phase 3 complete. All ten planned tasks (3.1-3.10) landed, plus one
 production bug (write_line starvation) found and fixed along the way.
 Binary reinstalled via `cargo install --path crates/ttyt-cli --force`;
 `ttyt --help` runs correctly from a fresh shell.
+
+2026-07-30 (continued) -- first public release
+------------------------------------------------
+Pushed to GitHub for the first time (public: github.com/zflow-byte/ttyt).
+Before pushing: independent security review (security subagent), full
+`git log -p --all` sweep for secrets across every commit (clean), added a
+missing `LICENSE` (MIT, matching Cargo.toml's declared license), and
+expanded `.gitignore` (editor dirs, swap files, defensive config/history
+entries). Review found and fixed two real gaps: default redaction
+patterns missed SNMPv3 auth/priv passphrases and VRRP/HSRP plaintext
+auth (added `\bauth\b`/`\bpriv\b`/`\bauthentication\b`/`\bcleartext\b`),
+and default dangerous-command patterns were Cisco-IOS-shaped only --
+Comware's `reboot` and JunOS's `request system reboot`/`zeroize` sailed
+past the confirm-before-send guard unconfirmed (added all three).
+Regression tests added for both directly against `Redactor`/
+`DangerousCommandGuard`. README's status line lost its reference to
+`outputs/2026-07-29-smart-console-plan.md` "in the parent workspace" --
+that file lives in a private multi-project workspace this repo was
+extracted from, not something that ships with the public repo.
+
+Tagged and pushed `v0.1.0`. Filled in `Formula/ttyt.rb`'s real GitHub
+path and, once the tag existed, its real `sha256` (was a placeholder) --
+verified by actually building and testing from the real release tarball,
+not just hashing it. Published a proper tap
+(github.com/zflow-byte/homebrew-ttyt) so `brew tap zflow-byte/ttyt &&
+brew install ttyt` works as a real single-command install; along the way
+discovered current Homebrew (6.x) rejects installing a bare formula file
+outside a tap, and requires one-time `brew trust` for a third-party tap
+before its formulae will load -- both documented in README. Also found
+and fixed a PATH-shadow conflict on the test machine: `~/.cargo/bin`
+(from earlier `cargo install --path crates/ttyt-cli` testing this
+session) sat ahead of Homebrew's bin directory, silently shadowing the
+Homebrew-installed binary -- removed the cargo-installed copy so `ttyt`
+resolves to the Homebrew one, and documented the gotcha in README for
+anyone in the same situation.
+
+**Real bug found via actual hardware testing (v0.1.0), fixed in v0.1.1:**
+`widgets/console.rs` built its scrollback+input-line content as a
+`Paragraph`, which top-aligns by default. With little/no scrollback (a
+freshly connected or quiet device -- exactly the common case right after
+`connect`), the rendered lines were far shorter than the pane's height,
+so the input line rendered a few rows below the pane's top border while
+the reported terminal cursor position stayed calculated as the pane's
+actual last row regardless -- a visible gap between the "> " prompt text
+and the blinking cursor, with no way to tell what mode the session was in
+or how much had been typed before Enter would submit it. Existing test
+coverage never caught this because `widgets::mod::tests::render_to_string`
+flattens the entire screen buffer into one string before asserting,
+checking only that content appears *somewhere*, never *which row*.
+
+Fixed by padding `lines` with leading blank lines up to the pane's full
+height before building the `Paragraph`, so the input line always lands
+on the actual last row, matching how a real terminal fills upward from
+the bottom rather than top-aligning. Added a real regression test
+(`input_line_renders_on_the_pane_last_row_even_with_no_scrollback`) that
+checks row *position* directly via `TestBackend`'s buffer content at a
+specific row -- confirmed it actually catches the bug by reverting the
+fix locally and re-running (test failed as expected: cursor row was
+blank), then restoring it (test passed).
+
+Bumped workspace version 0.1.0 -> 0.1.1 (Cargo.toml + Cargo.lock), tagged
+and pushed `v0.1.1`, re-verified full fmt/clippy -D warnings/test (3x)
+clean: 222 tests (152 core + 67 ui + 3 cli). Formula/ttyt.rb's `url`/
+`sha256` updated to point at the real v0.1.1 tarball -- v0.1.0 remains
+tagged in git history as the record of what was actually reviewed and
+published first, not deleted or force-moved.
