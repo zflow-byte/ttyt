@@ -1,6 +1,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod config;
+pub mod config_summary;
 pub mod detector;
 pub mod device;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod plugin;
 pub mod session;
 
 pub use config::Config;
+pub use config_summary::{ConfigSummary, summarize as summarize_config};
 pub use error::CoreError;
 pub use events::{ConnectionState, EventBus, SessionEvent, SessionId};
 pub use model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode, VendorDetectionStatus};
