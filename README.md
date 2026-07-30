@@ -7,9 +7,7 @@ multi-tab sessions, a fuzzy command palette, TAB autocomplete, a
 confirm-before-send guard for dangerous commands, and session replay, in
 the spirit of LazyGit/k9s/btop.
 
-**Status: Phase 3 of 3 complete.** Every task in the plan
-(`outputs/2026-07-29-smart-console-plan.md` in the parent workspace --
-filename kept from before the project was renamed to `ttyt`) is
+**Status: Phase 3 of 3 complete.** All three planned phases are
 implemented: connect/console/record against real serial hardware, live
 multi-vendor detection (Cisco, Dell OS10, Aruba CX, Comware, JunOS, plus a
 Fortinet recognition-only stub), persistent Ctrl-R history search,
