@@ -206,6 +206,21 @@ impl Session {
         self.hint = Some(format!("{key}: not yet implemented"));
     }
 
+    /// ESC's behavior in `Mode::Normal` (the other modes handle their own
+    /// ESC directly: `on_key_in_history_search` cancels leaving `input`
+    /// untouched, `on_key_in_confirm_send` declines). With no overlay
+    /// open there's nothing to close, so ESC clears the in-progress input
+    /// line instead of being a permanent no-op -- "closes whatever's open,
+    /// else clears what you're typing" is one consistent rule rather than
+    /// a stubbed-out key waiting for a menu system no Phase 3 task builds.
+    fn on_esc_in_normal_mode(&mut self) {
+        if self.input.is_empty() {
+            self.hint = Some("ESC: nothing to clear".to_string());
+        } else {
+            self.input.clear();
+        }
+    }
+
     /// Handles one key event already known to be scoped to this session
     /// (global keys -- Ctrl+C, Ctrl+N -- are intercepted by `App::on_key`
     /// before reaching here). Ctrl+R enters/cycles history search
@@ -237,7 +252,7 @@ impl Session {
                 self.set_not_yet_implemented_hint("Ctrl+P")
             }
             (_, KeyCode::Tab) => self.on_tab(),
-            (_, KeyCode::Esc) => self.set_not_yet_implemented_hint("ESC"),
+            (_, KeyCode::Esc) => self.on_esc_in_normal_mode(),
             (_, KeyCode::Enter) => {
                 if !self.input.is_empty() {
                     let cmd = std::mem::take(&mut self.input);
@@ -832,11 +847,24 @@ mod tests {
             app.active_session().hint.as_deref(),
             Some("Ctrl+P: not yet implemented")
         );
+    }
 
+    #[test]
+    fn esc_in_normal_mode_clears_the_input_line() {
+        let mut app = App::new();
+        app.active_session_mut().input = "show ver".to_string();
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
+        assert_eq!(app.active_session().input, "");
+    }
+
+    #[test]
+    fn esc_with_empty_input_and_no_overlay_shows_a_hint_instead_of_a_no_op() {
+        let mut app = App::new();
+        assert_eq!(app.active_session().input, "");
         app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
         assert_eq!(
             app.active_session().hint.as_deref(),
-            Some("ESC: not yet implemented")
+            Some("ESC: nothing to clear")
         );
     }
 
