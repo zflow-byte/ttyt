@@ -39,11 +39,11 @@ installed binary.
 
 ### Homebrew (not yet published)
 
-`Formula/ttyt.rb` is a Homebrew formula for this project, ready
-for once the repo has a GitHub remote and a tagged release — see the
-comment at the top of that file for the two placeholder fields
-(`url`/`sha256`) that need filling in first. Until then it can only be
-exercised locally:
+`Formula/ttyt.rb` is a Homebrew formula for this project. The repo now
+has a real GitHub remote (<https://github.com/zflow-byte/ttyt>), but no
+tagged release yet — see the comment at the top of that file for the
+`sha256` placeholder that needs filling in once a `v0.1.0` tag exists.
+Until then it can only be exercised locally:
 
 ```bash
 brew install --build-from-source ./Formula/ttyt.rb
