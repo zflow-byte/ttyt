@@ -97,6 +97,16 @@ impl Default for Config {
                 "erase startup-config".to_string(),
                 "no shutdown".to_string(),
                 "shutdown".to_string(),
+                // Comware/H3C's reboot verb -- "reload" (above) is
+                // Cisco-shaped and does not match it, which would
+                // otherwise let a Comware `reboot` sail past this guard
+                // with no confirmation despite Comware being a fully
+                // supported vendor.
+                "reboot".to_string(),
+                // JunOS equivalents; JunOS has no "reload"/"shutdown"
+                // verbs at all in this shape.
+                "request system reboot".to_string(),
+                "request system zeroize".to_string(),
             ],
             redaction_patterns: vec![
                 r"(?i)\bpassword\b".to_string(),
@@ -111,6 +121,17 @@ impl Default for Config {
                 // Over-redacting a benign line containing "key" is the
                 // stated safe default here, not an oversight.
                 r"(?i)\bkey\b".to_string(),
+                // SNMPv3 `snmp-server user <name> <group> v3 auth <algo>
+                // <authpass> priv <algo> <privpass>` carries two real
+                // passphrases and matches none of the patterns above.
+                r"(?i)\bauth\b".to_string(),
+                r"(?i)\bpriv\b".to_string(),
+                // VRRP/HSRP plaintext authentication (`vrrp 1
+                // authentication text CLEARTEXT`, `standby 1
+                // authentication CLEARTEXT`) carries a real value in the
+                // clear and matches none of the patterns above either.
+                r"(?i)\bauthentication\b".to_string(),
+                r"(?i)\bcleartext\b".to_string(),
             ],
             history_path: default_history_path(),
             history_max_entries: default_history_max_entries(),
@@ -229,5 +250,46 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pre-publish security review (2026-07-30) found that the original
+    /// default redaction patterns had no path to catching SNMPv3
+    /// auth/priv passphrases or VRRP/HSRP plaintext authentication --
+    /// neither contains "password"/"secret"/"community"/"key". Regression
+    /// test against `Redactor` directly, not just the pattern strings, so
+    /// a future edit that accidentally breaks one of these regexes fails
+    /// loudly here.
+    #[test]
+    fn default_redaction_patterns_cover_snmpv3_and_fhrp_cleartext_auth() {
+        let redactor = crate::Redactor::new(&Config::default().redaction_patterns).unwrap();
+        assert_eq!(
+            redactor.redact(
+                "snmp-server user bob GROUP1 v3 auth sha AuthPass128 priv aes 128 PrivPass256"
+            ),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redactor.redact("vrrp 1 authentication text CLEARTEXT"),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redactor.redact("standby 1 authentication CLEARTEXT"),
+            "[REDACTED]"
+        );
+    }
+
+    /// Same review found the default dangerous-command patterns were
+    /// Cisco-IOS-shaped only: Comware's actual reboot verb is `reboot`,
+    /// not `reload`, and JunOS has neither -- so a Comware/JunOS reboot
+    /// previously sailed past the confirm-before-send guard unconfirmed
+    /// on two vendors this project fully supports.
+    #[test]
+    fn default_dangerous_command_patterns_cover_comware_and_junos_reboot_verbs() {
+        let guard =
+            crate::DangerousCommandGuard::new(&Config::default().dangerous_command_patterns)
+                .unwrap();
+        assert!(guard.is_dangerous("reboot"));
+        assert!(guard.is_dangerous("request system reboot"));
+        assert!(guard.is_dangerous("request system zeroize"));
     }
 }

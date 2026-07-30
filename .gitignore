@@ -1,3 +1,20 @@
+# Build artifacts
 /target
-logs/
+
+# Local config/data this project itself writes -- the real locations live
+# under the OS-standard app-data dir (see Config::default_path), these are
+# just defensive in case a custom-configured path ever lands inside the repo.
+/logs/
+/history*.txt
+/config.toml
+
+# OS cruft
 .DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
