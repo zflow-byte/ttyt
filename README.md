@@ -35,17 +35,16 @@ cargo install --path crates/ttyt-cli
 Re-run the same command with `--force` after pulling changes to update the
 installed binary.
 
-### Homebrew (not yet published)
+### Homebrew (not yet published as a tap)
 
-`Formula/ttyt.rb` is a Homebrew formula for this project. The repo now
-has a real GitHub remote (<https://github.com/zflow-byte/ttyt>), but no
-tagged release yet — see the comment at the top of that file for the
-`sha256` placeholder that needs filling in once a `v0.1.0` tag exists.
-Until then it can only be exercised locally:
-
-```bash
-brew install --build-from-source ./Formula/ttyt.rb
-```
+`Formula/ttyt.rb` points at the real `v0.1.0` GitHub release tarball with
+a verified `sha256` — the formula itself has been build- and test-tested
+end to end. It isn't published as a tap yet, though, and current Homebrew
+(6.x) refuses to install a bare formula file directly (`brew install
+--build-from-source ./Formula/ttyt.rb` now errors with "formulae must be
+in a tap"). Until a `zflow-byte/homebrew-ttyt` tap exists, the formula can
+only be exercised via a throwaway local tap — see the comment at the top
+of `Formula/ttyt.rb` for the exact commands.
 
 ## Verify
 
