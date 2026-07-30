@@ -134,5 +134,35 @@ original value. The file is created `0600`.
   each other, not that they match what a real device sends. Please test
   against real hardware before relying on this for production
   troubleshooting.
-- Linux and Windows are not supported yet (macOS only); this is explicit
-  Phase 3 groundwork, not a bug.
+- **Linux**: not supported yet, but the device scanner has groundwork for
+  it (`/dev/ttyUSB*`/`/dev/ttyACM*` naming, unit-tested against fixture
+  port names) — untested against a real Linux machine or VM, so still
+  groundwork, not a completed port. The connection layer itself
+  (`ConnectionHandle`/`open_serial_transport`) has no macOS-specific
+  assumptions; it accepts whatever port name the scanner (or `--port`)
+  hands it.
+- **Windows**: not supported, no implementation attempted — design note
+  only (Task 3.9), since actually building it is out of this phase's
+  scope:
+  - Serial enumeration itself is nearly free: the `serialport` crate
+    already returns Windows COM ports from `available_ports()`; the
+    scanner's platform filter (`is_callout_device_for`) would just need a
+    `"windows"` arm, likely `true` (no filtering) since Windows doesn't
+    have macOS's `cu.*`/`tty.*` duplicate-listing problem to begin with.
+  - Config/log/history paths are already Windows-safe: the `directories`
+    crate resolves XDG-style paths to their Windows equivalents
+    (`%APPDATA%`) without any code change here.
+  - **The real gap is file/directory permissions.**
+    `session::secure_fs`'s `0600`/`0700` guarantee — the mechanism this
+    project's security posture leans on to keep session recordings and
+    command history (redacted, but still real operational data) private
+    to the current user — is POSIX mode bits, `#[cfg(unix)]`-gated. The
+    existing `#[cfg(not(unix))]` fallback compiles on Windows but creates
+    files/directories with default, unrestricted permissions: on a shared
+    multi-user Windows machine, that's a real confidentiality gap, not a
+    cosmetic one. A real Windows port needs a Windows ACL equivalent
+    restricting access to the current user before it can honestly claim
+    the same guarantee this README makes for macOS/Linux.
+  - The Unix-PTY-based integration tests (`serialport::TTYPort::pair()`)
+    are already `#[cfg(unix)]`-gated, so Windows CI would build and run a
+    smaller test suite, not fail to build.

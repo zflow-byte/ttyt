@@ -210,3 +210,147 @@ behavior change beyond the OS config/data directory name:
 - Reinstalled the `PATH`-installed binary: `cargo uninstall
   smart-console-cli` then `cargo install --path crates/ttyt-cli`;
   `ttyt --help` runs correctly from a fresh shell.
+
+2026-07-30
+-----------
+Phase 3 (Workflow & polish) in progress. Each task below landed as its own
+commit with the full fmt/clippy -D warnings/test(x3) loop re-run clean
+before moving to the next; test totals are cumulative core+ui+cli counts
+at that point.
+
+- **Task 3.1 -- multi-session tabs.** `App` now holds `sessions:
+  Vec<Session>` + `active: usize` instead of a single session's fields
+  directly; every field that used to live on `App` moved onto `Session`.
+  `ttyt-core::events::SessionId` is a new newtype keying each session
+  (assigned once from its `--port` position, never reused -- sessions are
+  never removed at runtime this phase). `Ctrl+N` cycles the active tab; the
+  left panel renders one line per session with the active one marked. The
+  CLI's `connect()` now takes `Vec<String>` ports (repeatable `--port`),
+  opens one `ConnectionHandle`/`CommandHistory`/recorder/detector per port,
+  and tags each session's events onto one shared channel via a small
+  per-session forwarder task (`tokio::select!` can't fan over a `Vec` of
+  receivers, and stream-multiplexing crates are outside the mandated
+  dependency list).
+- **Task 3.4 -- confirm-before-send guard.** New `DangerousCommandGuard`
+  (`ttyt-core::session::guard`) compiles `Config::dangerous_command_patterns`
+  into regexes; Enter checks it before submitting and, on a match, enters a
+  new `Mode::ConfirmSend(String)` instead. Only a plain (no Ctrl/Alt
+  modifier) `y`/`Y` confirms; every other key declines and drops the
+  command. Found and fixed a real bypass during self-review after this
+  landed: the confirm handler originally matched on `KeyCode::Char('y')`
+  alone, so Ctrl+Y (readline "yank") matched identically to a plain 'y' and
+  silently confirmed a dangerous command -- fixed by also requiring no
+  Ctrl/Alt modifier, with a regression test.
+- **Decided ESC's Normal-mode behavior** before Task 3.2 could add a fourth
+  `Mode` variant that would need to interact with it: clears `input` if
+  non-empty, else shows a hint. (No Phase 3 task actually builds the "menu"
+  ESC was originally reserved for in Phase 1's comments.)
+- **Task 3.3 -- TAB autocomplete.** Every `VendorPlugin` gained a real
+  `suggestions(&PromptInfo) -> Vec<String>` (previously an empty-default
+  stub): Cisco/Dell OS10/Aruba CX share `plugin::common::cisco_style_
+  suggestions` (same `>`/`#`/`(config)#` grammar); Comware and JunOS have
+  their own vendor-specific verb tables. The detector computes suggestions
+  from the same `parse_prompt` call that produces `PromptChanged` and
+  publishes a new `SessionEvent::Suggestions(Vec<String>)` alongside it --
+  kept in the detector (not given to `ttyt-ui` via its own `PluginRegistry`)
+  so the UI crate never needs vendor logic. TAB inserts the next candidate
+  into the input line and cycles on repeated presses; never auto-submits.
+- **Task 3.2 -- command palette (`Ctrl+P`).** New `Mode::Palette
+  (PaletteState)`; candidates are `Session::suggestions` (mode-dependent)
+  + `Session::history` (most-recent-first), deduplicated. `fuzzy_matches`
+  is a hand-rolled case-insensitive ordered-subsequence matcher (no fuzzy
+  crate in the mandated dependency list). Ctrl+P is checked at the same
+  priority as Ctrl+R/Ctrl+C, before mode dispatch. With this, the full
+  keyboard map from the spec (Ctrl+C/N/P/L/R, TAB, ESC) is functional.
+- **Fixed a real write-latency bug** found while chasing wildly variable
+  (3.76s-78s) wall-clock time in a PTY-based integration test:
+  `ConnectionHandle::write_line` and the reader thread's read loop contend
+  for the same `Mutex<Box<dyn SerialTransport>>`; on an idle device (the
+  common case) the reader holds the lock for the full ~200ms read-timeout
+  cycle every iteration, releases it for nanoseconds, then immediately
+  re-locks -- under macOS's unfair `os_unfair_lock` a competing
+  `write_line` call could lose that race repeatedly and stall for seconds
+  to tens of seconds before actually reaching the device. Fixed with an
+  `Arc<AtomicUsize>` `write_pending` counter: `write_line` increments it
+  before locking, and `reader_loop` sleeps 2ms after each read (outside the
+  lock guard's scope) whenever a writer is waiting, guaranteeing it a
+  window. Worst-case write latency is now bounded to roughly one read
+  cycle. Regression test uses a 200ms-idle `MockTransport` cycle (matching
+  the real device timeout) asserting `write_line` returns within 500ms
+  under sustained reader contention.
+- **Task 3.5 -- session replay.** New `ttyt replay <path> [--speed N]`
+  subcommand (deliberately not a session type inside `connect()`: that
+  command's select loop indexes `handles[id.index()]` per `--port`, so a
+  replay tab with no matching `ConnectionHandle`/`CommandHistory` entry
+  would panic on the first Enter press). `ttyt_core::session::replay::run`
+  reads a saved log line by line and republishes each as
+  `SessionEvent::RawLine` at a fixed interval, feeding the same
+  detector/UI pipeline a live connection uses. Two format-driven decisions:
+  `record_line` writes no per-line timestamp, so "adjustable speed" means a
+  fixed lines-per-second rate, not fidelity to the original session's
+  timing; and the recorder's `--- connection state: ... ---` marker lines
+  replay as plain scrollback text rather than being re-parsed back into
+  `ConnectionStateChanged` (no structured round-trip format exists for
+  them) -- one side effect is a replay session's `connection_state` never
+  leaves `Disconnected`, which conveniently makes a single Ctrl+C quit
+  replay immediately via the existing `App::handle_ctrl_c` path, with no
+  replay-specific handling needed. Required adding tokio's `fs` feature
+  (only `io-util` was enabled before).
+- **Task 3.10 -- Fortinet plugin stub.** `FortinetPlugin::detect` matches a
+  loose banner token (`"FortiGate"`/`"FortiOS"`/`"Fortinet"`) and reports
+  vendor "Fortinet", platform "not yet supported"; `parse_prompt`/
+  `parse_output` are intentionally unimplemented. Registered **last** in
+  `PluginRegistry::with_default_plugins` -- first-match-wins order means a
+  loosely-token-matched stub must never get a chance to shadow a real
+  vendor. The cross-vendor "no plugin detects another's banner" matrix test
+  was extended from 5 to 6 fixtures to cover it.
+- **Task 3.6 -- config summary skeleton.** Per the plan doc's own framing
+  ("explicitly scoped as a future/experimental parser, not a completeness
+  requirement... implement a minimal version and flag remaining work
+  rather than stub it out silently"): `ttyt_core::config_summary::summarize`
+  extracts hostname/interfaces/vlans from a generic Cisco-shaped config
+  grammar. Deliberately **not** wired into the live pipeline or any UI
+  widget -- the 4-pane layout has no free pane for it and inventing a
+  fifth pane wasn't part of this task. Comware/JunOS's structurally
+  different config syntax is known-unsummarized (empty-ish result, not an
+  error).
+- **Task 3.7 -- theme finalization.** `Config.theme` (already existed,
+  defaulted to `"dark"`) was never actually read -- `ttyt_ui::run` hardcoded
+  `Theme::dark()`. Added `Theme::from_name(&str)` (unrecognized names fall
+  back to dark rather than refusing to start) and threaded it through as a
+  real parameter to `ttyt_ui::run`, called from both `connect()` and
+  `replay()`. Added a direct test for the design doc's "no rainbow colors"
+  constraint (every palette field is grayscale or one of three meaningful
+  accents) rather than relying on inspection alone. Only one theme exists;
+  finalization here means "properly wired and verified," not "a second
+  theme added."
+- **Task 3.8 -- Linux groundwork (scanner).** The scanner's platform check
+  used `cfg!(target_os = "macos")` directly, which meant a
+  `#[cfg(target_os = "linux")]`-gated test would never run on this (or most
+  contributors') macOS dev machine. Extracted `is_callout_device_for(name,
+  target_os: &str)` as a pure predicate parameterized on the platform
+  string, so both platforms' naming rules (`/dev/cu.*` vs
+  `/dev/ttyUSB*`/`/dev/ttyACM*`, excluding bare `/dev/ttyS*`) are unit
+  tested directly regardless of build platform. Untested against real
+  Linux hardware/VM -- groundwork, not a completed port. The connection
+  layer already had no macOS-specific path assumptions.
+- **Task 3.9 -- Windows groundwork (design note only, no implementation).**
+  Documented in README's "Known limitations": serial enumeration is nearly
+  free (the `serialport` crate already returns COM ports; the scanner
+  would just need a `"windows"` arm, likely permissive since Windows has no
+  `cu.*`/`tty.*` duplicate-listing problem), and config/log/history paths
+  are already Windows-safe via the `directories` crate. **The real gap is
+  file/directory permissions**: `session::secure_fs`'s `0600`/`0700`
+  guarantee is POSIX mode bits, `#[cfg(unix)]`-gated; the existing
+  `#[cfg(not(unix))]` fallback compiles on Windows but creates
+  files/directories with default, unrestricted permissions -- a real
+  confidentiality gap on a shared machine, not cosmetic. A real Windows
+  port needs a Windows ACL equivalent before it can honestly claim the same
+  guarantee this project makes on macOS/Linux.
+
+Cumulative test count after Task 3.8: 219 (150 core + 66 ui + 3 cli), all
+passing, verified 3x per commit. Remaining before Phase 3 is done: Phase 3
+verification pass + final README pass (still says "Phase 2 of 3 complete"
+and documents Ctrl+N/Ctrl+P/TAB/ESC as unimplemented -- both stale as of
+this entry, corrected in the next pass) + re-verification of the
+cross-phase security checklist.
