@@ -171,6 +171,7 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
             &mut session_events,
             submit_tx,
             disconnect_tx,
+            ttyt_ui::Theme::from_name(&config.theme),
         ));
         loop {
             tokio::select! {
@@ -225,6 +226,12 @@ pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("cannot open replay log {}: {e}", path.display()))?;
 
+    // Replay has no device to connect to and so needs nothing else out of
+    // Config (no log_dir/redaction/dangerous-command-guard) -- loaded only
+    // for the theme, so replay renders with the same palette `connect`
+    // would use rather than always falling back to the default.
+    let config = Config::load()?;
+
     let (session_tx, mut session_events) =
         tokio::sync::mpsc::unbounded_channel::<(SessionId, ttyt_core::SessionEvent)>();
 
@@ -278,6 +285,7 @@ pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
             &mut session_events,
             submit_tx,
             disconnect_tx,
+            ttyt_ui::Theme::from_name(&config.theme),
         ));
         loop {
             tokio::select! {

@@ -726,14 +726,18 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
 /// inbound nor outbound channel is acted on inside this crate -- that
 /// keeps `ttyt-ui` decoupled from `ttyt-core`'s connection/serial types;
 /// the caller owns every session's `ConnectionHandle` and reacts to both.
+/// `theme` is likewise the caller's choice (`Theme::from_name(&config.theme)`)
+/// rather than hardcoded here, for the same "no `ttyt-core` dependency"
+/// reason -- this crate resolves a theme *name* to a palette, but never
+/// reads `Config` itself.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     session_events: &mut mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
     submit_tx: mpsc::UnboundedSender<(SessionId, String)>,
     disconnect_tx: mpsc::UnboundedSender<SessionId>,
+    theme: Theme,
 ) -> std::io::Result<()> {
-    let theme = Theme::dark();
     let mut key_events = spawn_input_thread(Duration::from_millis(100));
 
     loop {
