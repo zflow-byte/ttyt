@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -27,5 +29,17 @@ pub enum Command {
         /// config.toml).
         #[arg(long)]
         baud: Option<u32>,
+    },
+    /// Replay a saved session log through the same TUI a live connection
+    /// uses (vendor detection, prompt parsing, scrollback), at a fixed
+    /// lines-per-second rate. The log format has no per-line timestamps,
+    /// so this reproduces the original session's content, not its timing.
+    Replay {
+        /// Path to a log file previously written under `log_dir`
+        /// (`log_dir/YYYY-MM-DD/HHMMSS.log`).
+        path: PathBuf,
+        /// Playback rate in lines per second.
+        #[arg(long, default_value_t = 5.0)]
+        speed: f64,
     },
 }

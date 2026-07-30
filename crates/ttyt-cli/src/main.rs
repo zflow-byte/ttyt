@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::ListDevices => commands::list_devices(),
         Command::Connect { ports, baud } => commands::connect(ports, baud).await,
+        Command::Replay { path, speed } => commands::replay(path, speed).await,
     }
 }
 

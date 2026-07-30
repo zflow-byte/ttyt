@@ -15,7 +15,7 @@ license = "MIT"
 ttyt-core = { path = "crates/ttyt-core" }
 ttyt-ui = { path = "crates/ttyt-ui" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
 serialport = "4"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

@@ -205,6 +205,102 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
     Ok(())
 }
 
+/// Replays a saved session log through the same TUI/detector pipeline a
+/// live `connect()` session uses -- a single session, no `ConnectionHandle`
+/// and no `CommandHistory`, since there is no device to write to or
+/// history to persist. Deliberately its own subcommand rather than a
+/// session type folded into `connect()`: that loop indexes
+/// `handles[id.index()]` on every submit/disconnect, one entry per
+/// `--port`, so a replay tab added to `app.sessions` without a matching
+/// `SessionHandles` entry would panic on the first Enter press in that
+/// tab.
+pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
+    // Fail fast on a bad path/permissions before entering raw-mode/the
+    // alternate screen, matching `connect()`'s upfront
+    // `open_serial_transport(..)?` -- otherwise the error would only
+    // surface as a silently-empty replay session once inside the TUI
+    // (the actual read happens later, inside a spawned task whose errors
+    // are only logged, not propagated).
+    tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot open replay log {}: {e}", path.display()))?;
+
+    let (session_tx, mut session_events) =
+        tokio::sync::mpsc::unbounded_channel::<(SessionId, ttyt_core::SessionEvent)>();
+
+    let mut app = ttyt_ui::App::with_session_count(1);
+    let id = SessionId::new(0);
+    app.sessions[0].port_name = Some(format!("replay:{}", path.display()));
+
+    let bus = Arc::new(EventBus::new(1024));
+    tokio::spawn(ttyt_core::detector::run(
+        PluginRegistry::with_default_plugins(),
+        Arc::clone(&bus),
+        bus.subscribe(),
+    ));
+
+    let mut forward_rx = bus.subscribe();
+    let forward_tx = session_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match forward_rx.recv().await {
+                Ok(event) => {
+                    if forward_tx.send((id, event)).is_err() {
+                        return; // UI side gone
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+
+    let replay_bus = Arc::clone(&bus);
+    tokio::spawn(async move {
+        if let Err(e) = ttyt_core::session::replay::run(&path, speed, replay_bus).await {
+            tracing::error!(error = %e, "session replay failed");
+        }
+    });
+    // The forwarder above holds its own clone; dropping this one lets
+    // `session_events` close once the forwarder exits (which happens when
+    // the replay task finishes and the bus's last publisher goes away).
+    drop(session_tx);
+
+    install_panic_hook();
+    let mut terminal = ttyt_ui::terminal::init()?;
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, String)>();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
+
+    let ui_result = {
+        let mut ui_future = Box::pin(ttyt_ui::run(
+            &mut terminal,
+            &mut app,
+            &mut session_events,
+            submit_tx,
+            disconnect_tx,
+        ));
+        loop {
+            tokio::select! {
+                res = &mut ui_future => break res,
+                // Replay has no live device: there's nothing to write a
+                // submitted command to and nothing to disconnect, so both
+                // channels are drained and discarded rather than acted on.
+                // Ctrl+C still quits -- a replay session's
+                // `connection_state` never leaves `Disconnected` (no
+                // `ConnectionStateChanged` events are published during
+                // replay), so `App::handle_ctrl_c` treats the first Ctrl+C
+                // as "already disconnected, no other tab up" and quits.
+                Some(_) = submit_rx.recv() => {}
+                Some(_) = disconnect_rx.recv() => {}
+            }
+        }
+    };
+
+    ttyt_ui::terminal::restore()?;
+    ui_result?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

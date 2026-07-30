@@ -1,6 +1,7 @@
 pub mod guard;
 pub mod history;
 pub mod recorder;
+pub mod replay;
 pub mod secure_fs;
 mod time_util;
 
