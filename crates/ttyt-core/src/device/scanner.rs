@@ -12,19 +12,20 @@ pub struct DeviceCandidate {
     pub suggested_bauds: Vec<u32>,
 }
 
-/// Enumerate serial ports on this machine, filtered to macOS's callout
-/// (`/dev/cu.*`) devices per spec — `/dev/tty.*` is the same underlying
-/// hardware exposed a second time and would otherwise double-list every
-/// adapter.
+/// Enumerate serial ports on this machine, filtered to the current
+/// platform's USB-serial naming convention (see [`is_callout_device`]).
 ///
 /// `baud_candidates` (normally `Config::baud_candidates`) is attached to
 /// every result as the set of bauds to offer for that port; the scanner
 /// does not probe the device to guess a baud rate.
 ///
 /// Note: this cannot be exercised end-to-end without physical USB-serial
-/// hardware attached; `to_candidate`/`friendly_vendor_name` below carry the
-/// unit-testable logic, and this function itself needs a manual hardware
-/// test to fully verify.
+/// hardware attached; `to_candidate`/`friendly_vendor_name`/
+/// `is_callout_device_for` below carry the unit-testable logic, and this
+/// function itself needs a manual hardware test to fully verify. macOS is
+/// this project's only supported platform (per the design doc); the Linux
+/// branch below is untested groundwork (Task 3.8), not a completed port --
+/// the README's platform support section says so explicitly.
 pub fn scan(baud_candidates: &[u32]) -> Result<Vec<DeviceCandidate>, CoreError> {
     let ports = serialport::available_ports()?;
     Ok(ports
@@ -35,12 +36,32 @@ pub fn scan(baud_candidates: &[u32]) -> Result<Vec<DeviceCandidate>, CoreError> 
 }
 
 fn is_callout_device(port_name: &str) -> bool {
-    if cfg!(target_os = "macos") {
-        port_name.contains("cu.")
-    } else {
-        // Linux/Windows enumeration rules are Phase 3 groundwork; until
-        // then, don't filter out ports on other platforms.
-        true
+    is_callout_device_for(port_name, std::env::consts::OS)
+}
+
+/// The actual filter logic, parameterized on a target-OS string rather
+/// than reading `cfg!(target_os = ..)` directly, so both platforms' naming
+/// conventions can be unit tested on whichever machine happens to be
+/// building this crate -- a `#[cfg(target_os = "linux")]`-gated test would
+/// simply never run in this (or most contributors') macOS-only dev
+/// environment, silently going unverified.
+fn is_callout_device_for(port_name: &str, target_os: &str) -> bool {
+    match target_os {
+        // `/dev/cu.*` per spec -- `/dev/tty.*` is the same underlying
+        // hardware exposed a second time and would otherwise double-list
+        // every adapter.
+        "macos" => port_name.contains("cu."),
+        // `/dev/ttyUSB*` (common USB-serial chipsets: FTDI, CP210x,
+        // CH340) and `/dev/ttyACM*` (USB CDC-ACM, e.g. many Cisco USB
+        // console cables) -- untested groundwork, see this function's
+        // caller's doc comment. Deliberately excludes bare `/dev/ttyS*`
+        // (built-in motherboard UARTs): this scanner is for USB-serial
+        // console adapters, the same class of device macOS's `cu.*`
+        // filter targets, not arbitrary onboard serial ports.
+        "linux" => port_name.contains("ttyUSB") || port_name.contains("ttyACM"),
+        // Windows/other: enumeration rules are future work (Task 3.9's
+        // design note); until then, don't filter out ports.
+        _ => true,
     }
 }
 
@@ -149,5 +170,35 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(!is_callout_device("/dev/tty.usbserial-1410"));
         }
+    }
+
+    /// `is_callout_device_for` is parameterized specifically so both
+    /// platforms' naming rules can be verified here regardless of which
+    /// platform is actually building/running this test -- see its doc
+    /// comment for why a `#[cfg(target_os = "linux")]`-gated test would be
+    /// the wrong tool (it would never run on a macOS dev machine).
+    #[test]
+    fn macos_naming_rule_keeps_cu_and_excludes_tty_dup() {
+        assert!(is_callout_device_for("/dev/cu.usbserial-1410", "macos"));
+        assert!(!is_callout_device_for("/dev/tty.usbserial-1410", "macos"));
+    }
+
+    #[test]
+    fn linux_naming_rule_keeps_ttyusb_and_ttyacm() {
+        assert!(is_callout_device_for("/dev/ttyUSB0", "linux"));
+        assert!(is_callout_device_for("/dev/ttyACM0", "linux"));
+    }
+
+    #[test]
+    fn linux_naming_rule_excludes_bare_onboard_serial_ports() {
+        assert!(!is_callout_device_for("/dev/ttyS0", "linux"));
+    }
+
+    #[test]
+    fn unrecognized_platform_does_not_filter_out_any_port() {
+        assert!(is_callout_device_for(
+            "/dev/whatever-this-platform-calls-it",
+            "windows"
+        ));
     }
 }
