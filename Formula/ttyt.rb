@@ -1,12 +1,13 @@
 # Homebrew formula for ttyt.
 #
-# Verified against v0.1.0's real release tarball (build + `brew test` both
-# passed): `sha256` above is the real hash, not a placeholder.
+# This is the canonical copy, kept in sync with the same file published
+# at github.com/zflow-byte/homebrew-ttyt (the real tap end users install
+# from: `brew tap zflow-byte/ttyt && brew install ttyt`). Verified against
+# v0.1.1's real release tarball (build + `brew test` both passed): `sha256`
+# below is the real hash, not a placeholder.
 #
-# Current Homebrew (6.x) rejects `brew install --build-from-source
-# ./Formula/ttyt.rb` on a bare path -- it now requires every formula to
-# live in a tap. Without publishing a separate `homebrew-ttyt` tap repo,
-# the way to exercise this file locally is a throwaway local tap:
+# To exercise this exact file locally instead of the published tap
+# (current Homebrew rejects a bare formula path outside any tap):
 #   mkdir -p "$(brew --repository)/Library/Taps/local/homebrew-test/Formula"
 #   cp Formula/ttyt.rb "$(brew --repository)/Library/Taps/local/homebrew-test/Formula/"
 #   brew install --build-from-source local/test/ttyt
@@ -15,8 +16,8 @@
 class Ttyt < Formula
   desc "TUI serial/network console for Cisco, Dell OS10, Aruba CX, Comware, JunOS"
   homepage "https://github.com/zflow-byte/ttyt"
-  url "https://github.com/zflow-byte/ttyt/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "4348a5ff108a4a2d633178b57c955d494374b75337d0b433bf61fc73d5f421aa"
+  url "https://github.com/zflow-byte/ttyt/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "bc106e60be2c27bd1e77bd89d1483580e6ae0a302ac1580e24f735ed3c262cca"
   license "MIT"
   head "https://github.com/zflow-byte/ttyt.git", branch: "main"
 
