@@ -16,7 +16,37 @@ the dangerous-command confirmation guard, and session replay. See
 `changes.log` for the detailed history and this file's "Known
 limitations" section below for what's still rough around the edges.
 
-## Build
+## Install
+
+### Homebrew (recommended)
+
+```bash
+brew tap zflow-byte/ttyt
+brew install ttyt
+```
+
+That's the whole thing — `ttyt --help` works immediately afterward, no
+`PATH` changes needed (Homebrew's own bin directory is already on `PATH`
+from Homebrew's own setup). Verified end to end against the real `v0.1.0`
+release: `brew install --build-from-source` and `brew test` both pass.
+
+If Homebrew refuses the first `brew install` with "Refusing to load
+formula ... from untrusted tap," that's Homebrew asking for one-time
+confirmation on a third-party tap — run this once, then retry:
+
+```bash
+brew trust zflow-byte/ttyt
+```
+
+**Don't also `cargo install` this project on the same machine** (see
+"Build from source" below) unless you mean to: `~/.cargo/bin` comes
+before Homebrew's bin directory in most default `PATH`s, so a
+cargo-installed `ttyt` silently shadows the Homebrew one — `brew install`
+will say so explicitly ("shadowed by /Users/you/.cargo/bin/ttyt") if this
+happens, and running `ttyt` afterward will keep running the old
+cargo-installed copy instead. Fix it with `cargo uninstall ttyt-cli`.
+
+### Build from source
 
 Requires the Rust stable toolchain (`rustup` — see <https://rustup.rs> if
 `cargo`/`rustc` aren't already installed).
@@ -25,8 +55,8 @@ Requires the Rust stable toolchain (`rustup` — see <https://rustup.rs> if
 cargo build --workspace
 ```
 
-To install the `ttyt` binary onto your `PATH` (so it runs like any
-other CLI tool, without `cargo run --`):
+To install the `ttyt` binary onto your `PATH` directly with cargo instead
+of Homebrew:
 
 ```bash
 cargo install --path crates/ttyt-cli
@@ -34,17 +64,6 @@ cargo install --path crates/ttyt-cli
 
 Re-run the same command with `--force` after pulling changes to update the
 installed binary.
-
-### Homebrew (not yet published as a tap)
-
-`Formula/ttyt.rb` points at the real `v0.1.0` GitHub release tarball with
-a verified `sha256` — the formula itself has been build- and test-tested
-end to end. It isn't published as a tap yet, though, and current Homebrew
-(6.x) refuses to install a bare formula file directly (`brew install
---build-from-source ./Formula/ttyt.rb` now errors with "formulae must be
-in a tap"). Until a `zflow-byte/homebrew-ttyt` tap exists, the formula can
-only be exercised via a throwaway local tap — see the comment at the top
-of `Formula/ttyt.rb` for the exact commands.
 
 ## Verify
 
@@ -59,6 +78,11 @@ enforced by `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`
 at the root of every crate, not just a convention.
 
 ## Run
+
+The examples below use `cargo run --bin ttyt -- <args>` since that works
+from a source checkout either way. If you installed via Homebrew or
+`cargo install` (see "Install" above), drop that prefix and run `ttyt
+<args>` directly instead.
 
 List serial devices on this machine:
 
