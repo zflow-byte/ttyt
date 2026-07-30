@@ -354,3 +354,55 @@ verification pass + final README pass (still says "Phase 2 of 3 complete"
 and documents Ctrl+N/Ctrl+P/TAB/ESC as unimplemented -- both stale as of
 this entry, corrected in the next pass) + re-verification of the
 cross-phase security checklist.
+
+Phase 3 verification pass (Phase 3 exit criteria, plan.md lines 344-352):
+- Full keyboard map from the spec confirmed functional: Ctrl+C, Ctrl+N,
+  Ctrl+P, Ctrl+L, Ctrl+R, TAB, ESC -- all implemented across Tasks
+  3.1-3.4, no stubs or "not yet implemented" hints remaining for any of
+  them.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, and `cargo test --workspace` (3x) all clean: 219 tests total
+  (150 core + 66 ui + 3 cli), 0 failures across all three runs.
+- README rewritten for a junior teammate: status line updated to "Phase 3
+  of 3 complete"; full keybinding table (was: 3 keys documented, 4 marked
+  "not yet implemented"); multi-`--port` tab example added alongside the
+  single-port one; new "Session replay" section with a worked example;
+  "Command history" section updated for the per-port history file
+  scheme; "Known limitations" heading dropped its stale "(Phase 2)"
+  suffix and gained entries for the Fortinet stub's actual behavior, the
+  unwired config-summary parser, and the existing Linux/Windows notes.
+- Cross-phase security checklist (plan.md lines 356-366) re-verified
+  explicitly, not just assumed from "tests pass":
+  - No `unwrap()`/`expect()`/`panic!()` outside test code: still enforced
+    by `#![deny(...)]` at every crate root; the clean clippy run above
+    confirms it actually fires, not just that the attribute is present.
+  - Redaction: re-ran the redaction-specific tests directly (`cargo test
+    --workspace redact` / `... permission`) -- 8 redaction tests + 3
+    permission tests, all passing. Phase 3 added no new vendor
+    password/secret syntax (Fortinet's plugin has no parse_output at all),
+    so no new redaction pattern was needed.
+  - No auto-execution from suggestions/autocomplete/palette: verified by
+    reading the code, not just trusting tests -- `on_tab` only ever
+    mutates `input`; the palette's Enter handler (`on_key_in_palette`)
+    only ever sets `self.input = matched.to_string()` and returns to
+    `Mode::Normal`, never touching `pending_submit`. The *only* path to
+    `pending_submit` is Enter from `Mode::Normal`, which unconditionally
+    checks `guard.is_dangerous(&cmd)` first. Existing test
+    `enter_accepts_palette_match_without_auto_submitting` covers this.
+  - Dangerous-command confirmation has no bypass path: same code reading
+    as above, plus the Ctrl+Y bypass already found and fixed earlier this
+    phase (modifier check added to `on_key_in_confirm_send`).
+  - No dynamic plugin loading: still a compile-time `VendorPlugin` trait +
+    `PluginRegistry`, unchanged this phase; Fortinet is a sixth compiled-in
+    impl, not a loaded one.
+  - Log/history file permissions remain `0600`/`0700` on the supported
+    platforms (macOS/Linux): confirmed by the permission tests above.
+    Windows does *not* have this guarantee yet -- documented as a real
+    (not cosmetic) gap in README's Task 3.9 section, since the
+    `#[cfg(not(unix))]` fallback path compiles but doesn't restrict
+    permissions.
+
+Phase 3 complete. All ten planned tasks (3.1-3.10) landed, plus one
+production bug (write_line starvation) found and fixed along the way.
+Binary reinstalled via `cargo install --path crates/ttyt-cli --force`;
+`ttyt --help` runs correctly from a fresh shell.

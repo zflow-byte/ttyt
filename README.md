@@ -3,15 +3,20 @@
 A terminal-only (TUI) serial/network console for network engineers working
 Cisco, Dell OS10, Aruba CX, Comware, and JunOS devices — live vendor
 detection, a real-time event feed, automatic redacted session recording,
-and multi-tab sessions, in the spirit of LazyGit/k9s/btop.
+multi-tab sessions, a fuzzy command palette, TAB autocomplete, a
+confirm-before-send guard for dangerous commands, and session replay, in
+the spirit of LazyGit/k9s/btop.
 
-**Status: Phase 2 of 3 complete.** Single-session connect/console/record
-works end to end against real serial hardware, with live multi-vendor
-detection (Cisco, Dell OS10, Aruba CX, Comware, JunOS) and persistent
-Ctrl-R command history search. Tabs, the command palette, and a config
-summary view are Phase 3 (see
-`outputs/2026-07-29-smart-console-plan.md` in the parent workspace --
-filename kept from before the project was renamed to `ttyt`).
+**Status: Phase 3 of 3 complete.** Every task in the plan
+(`outputs/2026-07-29-smart-console-plan.md` in the parent workspace --
+filename kept from before the project was renamed to `ttyt`) is
+implemented: connect/console/record against real serial hardware, live
+multi-vendor detection (Cisco, Dell OS10, Aruba CX, Comware, JunOS, plus a
+Fortinet recognition-only stub), persistent Ctrl-R history search,
+multiple concurrent session tabs, the command palette, TAB autocomplete,
+the dangerous-command confirmation guard, and session replay. See
+`changes.log` for the detailed history and this file's "Known
+limitations" section below for what's still rough around the edges.
 
 ## Build
 
@@ -70,20 +75,52 @@ Connect to one (macOS callout devices look like `/dev/cu.usbserial-1410`):
 cargo run --bin ttyt -- connect --port /dev/cu.usbserial-1410 --baud 9600
 ```
 
+Connect to several at once, opened as tabs (repeat `--port`, one baud rate
+applies to all of them):
+
+```bash
+cargo run --bin ttyt -- connect --port /dev/cu.usbserial-1410 --port /dev/cu.usbserial-1420 --baud 9600
+```
+
 `--baud` is optional; it defaults to the first entry in `config.toml`'s
 `baud_candidates` (9600 unless you've changed it). Config lives at the OS
 standard location (macOS:
 `~/Library/Application Support/ttyt/config.toml`) and is created
 with defaults on first run.
 
-Keybindings inside the console: `Ctrl+C` disconnect (quits if already
-disconnected — there's no other quit key yet), `Ctrl+L` clear, `Ctrl+R`
-reverse history search (bash `reverse-i-search` style: repeated presses
-cycle to older matches, typing filters, Enter accepts the match into the
-input line without submitting it, Esc cancels). Both `Ctrl+C` and `Ctrl+R`
-work even while a history search is active. `Ctrl+N`, `Ctrl+P`, `TAB`,
-`ESC` are defined by the spec but not implemented until Phase 3 — pressing
-them shows a "not yet implemented" hint instead of doing nothing silently.
+Keybindings inside the console:
+
+| Key      | Action |
+|----------|--------|
+| `Ctrl+C` | Disconnect the focused tab; a second `Ctrl+C` on an already-disconnected tab quits the app once every other tab is also disconnected. |
+| `Ctrl+N` | Cycle to the next session tab (wraps around; a no-op hint if only one tab is open). |
+| `Ctrl+P` | Open the command palette: fuzzy-filter over this mode's TAB-suggestions plus recent history, `Ctrl+P` again cycles to the next match, Enter accepts the match into the input line (does **not** submit it), Esc cancels. |
+| `Ctrl+L` | Clear the console scrollback. |
+| `Ctrl+R` | Reverse history search (bash `reverse-i-search` style): repeated presses cycle to older matches, typing filters, Enter accepts the match into the input line (does **not** submit it), Esc cancels. |
+| `TAB`    | Autocomplete the input line from the current vendor mode's suggestion table; a second consecutive press cycles to the next candidate. Never auto-submits. |
+| `ESC`    | Clears the input line if it has anything typed; otherwise shows a hint. Also cancels an active history search or command palette. |
+| `Enter`  | Submit the input line. If it matches a configured dangerous-command pattern (`reload`, `write erase`, `shutdown`, ...), asks for a plain `y`/`Y` confirmation first instead of sending it immediately — any other key declines and drops it. |
+
+`Ctrl+C`, `Ctrl+N`, and `Ctrl+P` all stay reachable even while a history
+search or the palette is active, so there's always a way out of a mode
+without getting stuck in it.
+
+### Session replay
+
+Play a saved recording back through the same console UI (vendor
+detection, prompt/mode parsing, scrollback) instead of connecting to a
+device:
+
+```bash
+cargo run --bin ttyt -- replay ~/Library/Application\ Support/ttyt/logs/2026-07-30/143022.log --speed 10
+```
+
+`--speed` is lines per second (default 5) — the log format has no
+per-line timestamps (see "Session recordings" below), so this reproduces
+what happened in the session, not how quickly it originally happened.
+Redacted lines replay as `[REDACTED]`, same as they were written; that's
+expected, not a replay bug. There's no live device in a replay session, so
+typed commands go nowhere — press `Ctrl+C` once to quit.
 
 ## Session recordings
 
@@ -101,26 +138,37 @@ conversion needs one (or unsafe FFI); see
 
 ## Command history
 
-Submitted commands are persisted to `history.txt` under the same config
-directory as `config.toml`, capped at `history_max_entries` (default 1000).
-**The same redaction control as session recordings applies**: a command is
-redacted before it's kept in memory or written to disk, so a past sensitive
-command can only ever show as `[REDACTED]` in Ctrl-R search, never the
-original value. The file is created `0600`.
+Submitted commands are persisted under the same config directory as
+`config.toml`, capped at `history_max_entries` (default 1000) per session.
+Each `--port` gets its own history file (`history-<sanitized-port-name>.txt`)
+rather than one shared file, so two concurrent tabs' writers can't
+interleave into the same file. **The same redaction control as session
+recordings applies**: a command is redacted before it's kept in memory or
+written to disk, so a past sensitive command can only ever show as
+`[REDACTED]` in Ctrl-R search or the command palette, never the original
+value. Every history file is created `0600`.
 
-## Known limitations (Phase 2)
+## Known limitations
 
 - Vendor detection scans up to 40 lines after connect looking for a known
-  banner; if none of the 5 plugins match in that window, vendor status
-  becomes `Unknown` rather than continuing to scan indefinitely.
+  banner; if none of the plugins match in that window, vendor status
+  becomes `Unknown` rather than continuing to scan indefinitely. Fortinet
+  is a recognition-only stub: a detected FortiGate/FortiOS device shows its
+  vendor in the header but stays at hostname/mode `-` for the rest of the
+  session, since `parse_prompt`/`parse_output` aren't implemented for it —
+  that's the intended "recognized but unsupported" behavior, not a bug.
 - Non-Cisco/Comware console message classification (errors/warnings/link
   status) is not implemented — Dell OS10, Aruba CX, and JunOS `parse_output`
   return no classified events. This is a deliberate scope decision (see
   `changes.log`'s Phase 2 entry), not an oversight: their console message
   formats weren't confirmed precisely enough to classify without risking
   misclassifying an unrelated line.
-- No tabs, split-view, command palette, autocomplete, session replay, or
-  config summary view yet (Phase 3).
+- A config-summary parser (`ttyt_core::config_summary::summarize`) exists
+  and is tested, but is **not wired into the TUI** — the 4-pane layout has
+  no free pane for it (the left panel is already the session-tab list), so
+  it's a standalone core module for now, not a visible feature. It also
+  only recognizes a generic Cisco-shaped config grammar; Comware/JunOS
+  config text produces an empty-ish summary.
 - Verified on this development machine against this machine's own serial
   ports and via a Unix PTY pair (`serialport::TTYPort::pair()`) for the
   connection manager's read/reconnect logic, plus `ratatui::TestBackend`
