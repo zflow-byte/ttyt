@@ -38,6 +38,20 @@ pub struct HistorySearchState {
     pub match_index: usize,
 }
 
+/// Command-palette state (Ctrl+P), active while open. `query` fuzzy-
+/// filters `Session::palette_candidates()` (mode suggestions then recent
+/// history, most-recent-first, deduplicated); `index` (mod the match
+/// count) selects which match is current, so repeated Ctrl+P cycles the
+/// same way repeated Ctrl-R does. Not stored as a candidate list itself,
+/// same reasoning as `HistorySearchState`: recomputing live means a
+/// changing `suggestions`/`history` can never leave this holding a stale
+/// list, at the cost of only ever needing `query`+`index` here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaletteState {
+    pub query: String,
+    pub index: usize,
+}
+
 /// TAB-cycle state: `prefix` is the input text as it stood before the
 /// first TAB press, `candidates` are `Session::suggestions` filtered to
 /// those starting with it, `index` (mod the candidate count) is which one
@@ -70,6 +84,11 @@ pub(crate) enum Mode {
     /// re-enters it into `history`: history records what was actually
     /// sent, not what was typed and abandoned.
     ConfirmSend(String),
+    /// Command palette open (Ctrl+P): fuzzy search over mode suggestions
+    /// plus recent history, per plan 3.2. Enter inserts the current
+    /// match into `input` without submitting it, same principle as
+    /// history search and TAB-autocomplete.
+    Palette(PaletteState),
 }
 
 /// One connection/tab's worth of UI state. `App` owns a `Vec<Session>`;
@@ -202,10 +221,6 @@ impl Session {
         self.pending_submit.take()
     }
 
-    fn set_not_yet_implemented_hint(&mut self, key: &str) {
-        self.hint = Some(format!("{key}: not yet implemented"));
-    }
-
     /// ESC's behavior in `Mode::Normal` (the other modes handle their own
     /// ESC directly: `on_key_in_history_search` cancels leaving `input`
     /// untouched, `on_key_in_confirm_send` declines). With no overlay
@@ -223,15 +238,19 @@ impl Session {
 
     /// Handles one key event already known to be scoped to this session
     /// (global keys -- Ctrl+C, Ctrl+N -- are intercepted by `App::on_key`
-    /// before reaching here). Ctrl+R enters/cycles history search
-    /// regardless of mode -- including declining a pending confirm-send,
-    /// on the same principle Ctrl+C already uses: switching away from a
-    /// mode always discards it safely rather than carrying it forward.
-    /// While in a mode, every other key is handled by that mode's own
-    /// handler instead of the normal bindings below.
+    /// before reaching here). Ctrl+R and Ctrl+P enter/cycle their overlay
+    /// regardless of mode -- including declining whatever else is open,
+    /// on the same principle Ctrl+C already uses: switching to a
+    /// different mode always discards the old one safely rather than
+    /// carrying it forward. While in a mode, every other key is handled
+    /// by that mode's own handler instead of the normal bindings below.
     fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
             self.cycle_history_search();
+            return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('p') {
+            self.cycle_palette();
             return;
         }
         match self.mode {
@@ -243,14 +262,15 @@ impl Session {
                 self.on_key_in_confirm_send(key);
                 return;
             }
+            Mode::Palette(_) => {
+                self.on_key_in_palette(key);
+                return;
+            }
             Mode::Normal => {}
         }
 
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => self.clear_console(),
-            (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
-                self.set_not_yet_implemented_hint("Ctrl+P")
-            }
             (_, KeyCode::Tab) => self.on_tab(),
             (_, KeyCode::Esc) => self.on_esc_in_normal_mode(),
             (_, KeyCode::Enter) => {
@@ -356,10 +376,99 @@ impl Session {
         }
         match &mut self.mode {
             Mode::HistorySearch(search) => search.match_index += 1,
-            Mode::Normal | Mode::ConfirmSend(_) => {
+            Mode::Normal | Mode::ConfirmSend(_) | Mode::Palette(_) => {
                 self.mode = Mode::HistorySearch(HistorySearchState::default())
             }
         }
+    }
+
+    /// Enters the command palette on the first Ctrl+P; cycles to the
+    /// next match on subsequent presses, same convention as Ctrl-R.
+    /// Candidates are `palette_candidates()` (mode suggestions + recent
+    /// history); with none available, shows a hint rather than opening
+    /// an overlay that could never show a match.
+    fn cycle_palette(&mut self) {
+        if self.palette_candidates().is_empty() {
+            self.hint = Some("Ctrl+P: no commands to show yet".to_string());
+            return;
+        }
+        match &mut self.mode {
+            Mode::Palette(state) => state.index += 1,
+            Mode::Normal | Mode::ConfirmSend(_) | Mode::HistorySearch(_) => {
+                self.mode = Mode::Palette(PaletteState::default())
+            }
+        }
+    }
+
+    /// Key handling while `mode` is `Palette`: typed characters edit the
+    /// fuzzy-search query, Enter accepts the current match into the input
+    /// line (never auto-submits it), Esc cancels leaving `input`
+    /// untouched -- same shape as `on_key_in_history_search`.
+    fn on_key_in_palette(&mut self, key: KeyEvent) {
+        let Mode::Palette(mut state) = std::mem::take(&mut self.mode) else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {} // cancelled: mode reset to Normal, input untouched
+            KeyCode::Enter => {
+                if let Some(matched) = self.current_palette_match(&state) {
+                    self.input = matched.to_string();
+                }
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.index = 0;
+                self.mode = Mode::Palette(state);
+            }
+            KeyCode::Char(c) => {
+                state.query.push(c);
+                state.index = 0;
+                self.mode = Mode::Palette(state);
+            }
+            _ => self.mode = Mode::Palette(state),
+        }
+    }
+
+    /// Palette source list: this mode's TAB-suggestions first (still
+    /// relevant to what you'd type next), then recent history most-
+    /// recent-first, deduplicated so a command appearing in both isn't
+    /// offered twice.
+    fn palette_candidates(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for candidate in self
+            .suggestions
+            .iter()
+            .map(String::as_str)
+            .chain(self.history.iter().rev().map(String::as_str))
+        {
+            if seen.insert(candidate) {
+                out.push(candidate);
+            }
+        }
+        out
+    }
+
+    /// `palette_candidates()` fuzzy-filtered by `query` (case-insensitive
+    /// subsequence match -- every character of `query`, in order, appears
+    /// somewhere in the candidate; not necessarily contiguous).
+    fn palette_matches(&self, query: &str) -> Vec<&str> {
+        self.palette_candidates()
+            .into_iter()
+            .filter(|c| fuzzy_matches(c, query))
+            .collect()
+    }
+
+    fn current_palette_match(&self, state: &PaletteState) -> Option<&str> {
+        let matches = self.palette_matches(&state.query);
+        if matches.is_empty() {
+            return None;
+        }
+        Some(matches[state.index % matches.len()])
+    }
+
+    pub(crate) fn is_palette_active(&self) -> bool {
+        matches!(self.mode, Mode::Palette(_))
     }
 
     /// Key handling while `mode` is `HistorySearch`: typed characters edit
@@ -429,9 +538,30 @@ impl Session {
                 format!("(reverse-i-search)`{}': {matched}", search.query)
             }
             Mode::ConfirmSend(cmd) => format!("Send \"{cmd}\" to the device? [y/N] "),
+            Mode::Palette(state) => {
+                let matched = self.current_palette_match(state).unwrap_or("");
+                format!("(palette)`{}': {matched}", state.query)
+            }
             Mode::Normal => format!("> {}", self.input),
         }
     }
+}
+
+/// Case-insensitive subsequence fuzzy match for the command palette:
+/// every character of `query`, in order, appears somewhere in
+/// `candidate` (not necessarily contiguous) -- the same relaxed
+/// "fzf-style" matching a fuzzy finder uses, implemented directly since
+/// no fuzzy-matching crate is in the mandated dependency list. An empty
+/// query matches everything (nothing typed yet -> show all candidates).
+fn fuzzy_matches(candidate: &str, query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+    let mut query_chars = query_lower.chars().peekable();
+    for c in candidate.to_lowercase().chars() {
+        if query_chars.peek() == Some(&c) {
+            query_chars.next();
+        }
+    }
+    query_chars.peek().is_none()
 }
 
 /// Central UI state: one or more concurrent `Session`s (Phase 3 tabs) plus
@@ -840,13 +970,16 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_keys_set_a_visible_hint_instead_of_being_silently_dropped() {
+    fn ctrl_p_with_no_candidates_shows_a_hint_instead_of_a_no_op() {
         let mut app = App::new();
+        assert!(app.active_session().suggestions.is_empty());
+        assert!(app.active_session().history.is_empty());
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
         assert_eq!(
             app.active_session().hint.as_deref(),
-            Some("Ctrl+P: not yet implemented")
+            Some("Ctrl+P: no commands to show yet")
         );
+        assert!(!app.active_session().is_palette_active());
     }
 
     #[test]
@@ -1393,6 +1526,137 @@ mod tests {
         assert_eq!(
             app.active_session_mut().take_pending_submit(),
             Some("show version".to_string())
+        );
+    }
+
+    #[test]
+    fn fuzzy_matches_is_a_case_insensitive_ordered_subsequence() {
+        assert!(fuzzy_matches("show version", "sv"));
+        assert!(fuzzy_matches("show version", "SHOWVER"));
+        assert!(fuzzy_matches("configure terminal", "cfgterm"));
+        assert!(fuzzy_matches("anything", ""));
+        assert!(
+            !fuzzy_matches("version", "rev"),
+            "order matters: 'r' only appears after 'e' in \"version\""
+        );
+        assert!(!fuzzy_matches("show version", "xyz"));
+    }
+
+    #[test]
+    fn ctrl_p_opens_palette_over_suggestions_and_history_combined() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["show version".to_string()];
+        app.active_session_mut().history = vec!["configure terminal".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+
+        assert!(app.active_session().is_palette_active());
+        // Empty query -> first candidate is suggestions[0].
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`': show version"
+        );
+    }
+
+    #[test]
+    fn typing_in_palette_fuzzy_filters_query_not_the_input_line() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["show version".to_string()];
+        app.active_session_mut().history = vec!["configure terminal".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        // "cfgterm" as a subsequence fuzzy-matches "configure terminal"
+        // but not "show version".
+        for c in "cfgterm".chars() {
+            app.on_key(key(KeyModifiers::NONE, KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.active_session().input, "", "must not leak into input");
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`cfgterm': configure terminal"
+        );
+    }
+
+    #[test]
+    fn repeated_ctrl_p_cycles_to_the_next_match() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions =
+            vec!["show version".to_string(), "show vlan".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`': show version"
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`': show vlan"
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`': show version",
+            "should wrap back to the first candidate"
+        );
+    }
+
+    #[test]
+    fn enter_accepts_palette_match_without_auto_submitting() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["configure terminal".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+
+        assert!(!app.active_session().is_palette_active());
+        assert_eq!(app.active_session().input, "configure terminal");
+        assert_eq!(app.active_session_mut().take_pending_submit(), None);
+    }
+
+    #[test]
+    fn esc_cancels_palette_without_touching_input() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["configure terminal".to_string()];
+        app.active_session_mut().input = "unrelated".to_string();
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
+
+        assert!(!app.active_session().is_palette_active());
+        assert_eq!(app.active_session().input, "unrelated");
+    }
+
+    #[test]
+    fn ctrl_c_declines_a_pending_palette_rather_than_bypassing_confirm_guard() {
+        let mut app = app_with_dangerous_pattern("reload");
+        app.active_session_mut().suggestions = vec!["reload".to_string()];
+        app.active_session_mut().connection_state = ConnectionState::Connected;
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        assert!(app.active_session().is_palette_active());
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+
+        assert!(!app.active_session().is_palette_active());
+        assert!(app.active_session().disconnect_requested);
+    }
+
+    #[test]
+    fn duplicate_entries_between_suggestions_and_history_are_offered_once() {
+        let mut app = App::new();
+        app.active_session_mut().suggestions = vec!["show version".to_string()];
+        app.active_session_mut().history = vec!["show version".to_string()];
+
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('p')));
+
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "(palette)`': show version",
+            "cycling past the single deduplicated candidate should land \
+             back on it, not on a hidden duplicate"
         );
     }
 }
