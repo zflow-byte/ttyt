@@ -117,6 +117,12 @@ pub async fn run(
                 // The detector's own output, echoed back on the same
                 // bus it publishes to -- not re-processed as input.
             }
+            Ok(SessionEvent::PaginationPrompt(_)) => {
+                // A single-keystroke prompt, not a line to classify --
+                // the UI handles it directly (scrollback + passthrough
+                // mode), and there's nothing here for prompt/vendor
+                // detection to do with it.
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(skipped, "detector lagged, some lines were not classified");
             }

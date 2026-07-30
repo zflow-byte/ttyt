@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::CoreError;
-use crate::events::{ConnectionState, EventBus, LineAssembler, SessionEvent};
+use crate::events::{AssembledOutput, ConnectionState, EventBus, LineAssembler, SessionEvent};
 
 /// Minimal blocking transport abstraction satisfied by both a real
 /// `serialport::SerialPort` and, in tests, an in-memory mock. This is what
@@ -103,10 +103,24 @@ impl ConnectionHandle {
     /// a quiet device) can starve a waiting writer indefinitely under an
     /// unfair mutex (observed: multi-second to 78s waits in testing).
     pub async fn write_line(&self, line: &str) -> Result<(), CoreError> {
-        let transport = Arc::clone(&self.transport);
-        let write_pending = Arc::clone(&self.write_pending);
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
+        self.write_bytes(bytes).await
+    }
+
+    /// Write a single raw byte to the device with no newline appended --
+    /// e.g. a bare space, `\r`, or `q` in response to a `--More--`-style
+    /// pagination prompt, where the device is waiting for exactly one
+    /// keystroke rather than a submitted line. Shares `write_line`'s
+    /// `write_pending` wrapping so this path doesn't reintroduce the
+    /// reader/writer starvation `write_line` was fixed for.
+    pub async fn write_raw(&self, byte: u8) -> Result<(), CoreError> {
+        self.write_bytes(vec![byte]).await
+    }
+
+    async fn write_bytes(&self, bytes: Vec<u8>) -> Result<(), CoreError> {
+        let transport = Arc::clone(&self.transport);
+        let write_pending = Arc::clone(&self.write_pending);
 
         tokio::task::spawn_blocking(move || {
             write_pending.fetch_add(1, Ordering::SeqCst);
@@ -181,8 +195,15 @@ fn reader_loop<F>(
             Ok(0) => consecutive_errors += 1,
             Ok(n) => {
                 consecutive_errors = 0;
-                for line in assembler.feed(&buf[..n]) {
-                    bus.publish(SessionEvent::RawLine(line));
+                for item in assembler.feed(&buf[..n]) {
+                    match item {
+                        AssembledOutput::Line(line) => {
+                            bus.publish(SessionEvent::RawLine(line));
+                        }
+                        AssembledOutput::PaginationPrompt(prompt) => {
+                            bus.publish(SessionEvent::PaginationPrompt(prompt));
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -362,6 +383,65 @@ mod tests {
         handle.disconnect();
     }
 
+    #[tokio::test]
+    async fn write_raw_forwards_exactly_one_byte_with_no_newline_appended() {
+        let (writes_tx, writes_rx) = mpsc::channel();
+        let transport = MockTransport {
+            reads: std::collections::VecDeque::new(),
+            writes_tx,
+            idle_sleep: Duration::from_millis(5),
+        };
+        let bus = Arc::new(EventBus::new(16));
+
+        let mut handle = ConnectionHandle::spawn(Box::new(transport), bus, || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        handle.write_raw(b' ').await.unwrap();
+
+        let written = writes_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write should have been forwarded to the transport");
+        assert_eq!(
+            written,
+            vec![b' '],
+            "write_raw must send exactly the one byte, no trailing newline"
+        );
+
+        handle.disconnect();
+    }
+
+    #[tokio::test]
+    async fn unterminated_more_prompt_becomes_a_pagination_prompt_event() {
+        let (writes_tx, _writes_rx) = mpsc::channel();
+        let transport = MockTransport {
+            reads: std::collections::VecDeque::from([Ok(b"Router#show run\r\n--More--".to_vec())]),
+            writes_tx,
+            idle_sleep: Duration::from_millis(5),
+        };
+        let bus = Arc::new(EventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let mut handle = ConnectionHandle::spawn(Box::new(transport), Arc::clone(&bus), || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Connected)
+        );
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::RawLine("Router#show run".to_string())
+        );
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::PaginationPrompt("--More--".to_string())
+        );
+
+        handle.disconnect();
+    }
+
     /// Regression test for a real latency bug: the reader thread holds the
     /// transport mutex for the entire duration of each read (bounded by the
     /// port's read timeout -- 200ms on a real device, matched here), then
@@ -516,6 +596,85 @@ mod tests {
             .expect("timed out waiting for the real-PTY RawLine event")
             .unwrap();
         assert_eq!(event, SessionEvent::RawLine("Switch> ".to_string()));
+
+        handle.disconnect();
+    }
+
+    /// End-to-end proof of the full `--More--` passthrough round trip over
+    /// a real PTY pair, standing in for a manual test against a physical
+    /// device (no keyboard/TTY to drive the interactive `ttyt` binary
+    /// itself is available in this environment, so this exercises the
+    /// same real-OS-file-descriptor path `real_pty_bytes_flow_through_to_
+    /// raw_line_events` does, extended through `write_raw`): an
+    /// unterminated `--More--` write must surface as a `PaginationPrompt`
+    /// event, and responding with `write_raw` must deliver to the other
+    /// side of the PTY exactly the one byte pressed -- no newline, no
+    /// extra bytes, nothing left mangled in the assembler's buffer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_more_prompt_and_raw_key_response_round_trip() {
+        let (mut controller, device_side) =
+            serialport::TTYPort::pair().expect("failed to allocate a PTY pair for this test");
+        let device_side: Box<dyn serialport::SerialPort> = Box::new(device_side);
+        let device_side: Box<dyn SerialTransport> = Box::new(device_side);
+
+        let bus = Arc::new(EventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let mut handle = ConnectionHandle::spawn(device_side, Arc::clone(&bus), || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Connected)
+        );
+
+        // The device pages a `show run` and blocks -- no trailing newline,
+        // a real terminal is waiting on a single keystroke here.
+        std::io::Write::write_all(&mut controller, b"interface Gi0/1\r\n--More--")
+            .expect("write into the PTY controller side should succeed");
+
+        let line_event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for the real-PTY RawLine event")
+            .unwrap();
+        assert_eq!(
+            line_event,
+            SessionEvent::RawLine("interface Gi0/1".to_string())
+        );
+
+        let prompt_event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for the real-PTY PaginationPrompt event")
+            .unwrap();
+        assert_eq!(
+            prompt_event,
+            SessionEvent::PaginationPrompt("--More--".to_string())
+        );
+
+        // Respond as the UI would on a space keypress in Mode::Pagination.
+        handle
+            .write_raw(b' ')
+            .await
+            .expect("write_raw should succeed");
+
+        let received = tokio::task::spawn_blocking(move || {
+            use serialport::SerialPort;
+            controller
+                .set_timeout(Duration::from_secs(2))
+                .expect("set_timeout should succeed on a PTY controller");
+            let mut buf = [0u8; 64];
+            let n = std::io::Read::read(&mut controller, &mut buf).unwrap_or(0);
+            buf[..n].to_vec()
+        })
+        .await
+        .expect("blocking read of the PTY controller should not panic");
+        assert_eq!(
+            received,
+            vec![b' '],
+            "the device side must receive exactly the one raw byte, nothing else"
+        );
 
         handle.disconnect();
     }

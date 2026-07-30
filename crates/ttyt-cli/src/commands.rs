@@ -163,6 +163,7 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
     let mut terminal = ttyt_ui::terminal::init()?;
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, String)>();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
+    let (raw_key_tx, mut raw_key_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, u8)>();
 
     let ui_result = {
         let mut ui_future = Box::pin(ttyt_ui::run(
@@ -171,6 +172,7 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
             &mut session_events,
             submit_tx,
             disconnect_tx,
+            raw_key_tx,
             ttyt_ui::Theme::from_name(&config.theme),
         ));
         loop {
@@ -183,6 +185,16 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
                     }
                     if let Err(e) = session.connection.write_line(&line).await {
                         tracing::error!(error = %e, "failed to write to device");
+                    }
+                }
+                Some((id, byte)) = raw_key_rx.recv() => {
+                    // Single-keystroke passthrough for a --More---style
+                    // pagination prompt: not a submitted command, so no
+                    // history entry, just the raw byte straight to the
+                    // device (see Mode::Pagination / write_raw's doc
+                    // comments for why this needs its own path).
+                    if let Err(e) = handles[id.index()].connection.write_raw(byte).await {
+                        tracing::error!(error = %e, "failed to write raw key to device");
                     }
                 }
                 Some(id) = disconnect_rx.recv() => {
@@ -277,6 +289,7 @@ pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
     let mut terminal = ttyt_ui::terminal::init()?;
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, String)>();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
+    let (raw_key_tx, mut raw_key_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, u8)>();
 
     let ui_result = {
         let mut ui_future = Box::pin(ttyt_ui::run(
@@ -285,21 +298,23 @@ pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
             &mut session_events,
             submit_tx,
             disconnect_tx,
+            raw_key_tx,
             ttyt_ui::Theme::from_name(&config.theme),
         ));
         loop {
             tokio::select! {
                 res = &mut ui_future => break res,
                 // Replay has no live device: there's nothing to write a
-                // submitted command to and nothing to disconnect, so both
-                // channels are drained and discarded rather than acted on.
-                // Ctrl+C still quits -- a replay session's
+                // submitted command to and nothing to disconnect, so all
+                // three channels are drained and discarded rather than
+                // acted on. Ctrl+C still quits -- a replay session's
                 // `connection_state` never leaves `Disconnected` (no
                 // `ConnectionStateChanged` events are published during
                 // replay), so `App::handle_ctrl_c` treats the first Ctrl+C
                 // as "already disconnected, no other tab up" and quits.
                 Some(_) = submit_rx.recv() => {}
                 Some(_) = disconnect_rx.recv() => {}
+                Some(_) = raw_key_rx.recv() => {}
             }
         }
     };

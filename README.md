@@ -126,6 +126,20 @@ Keybindings inside the console:
 search or the palette is active, so there's always a way out of a mode
 without getting stuck in it.
 
+### Pagination (`--More--`) support
+
+Devices that page long output (`--More--` on Cisco/Dell OS10/Aruba CX,
+`---- More ----` on Comware, `---(more)---` on JunOS) block waiting for a
+single keystroke rather than a submitted line — ttyt recognizes this and
+switches the input line to a pass-through mode instead of the normal
+type-then-Enter flow:
+
+| Key | Action while a pagination prompt is active |
+|-----|--------|
+| `Space` / `Enter` / `q` / any other character | Sent to the device immediately as that one raw byte (`Enter` sends `\r`, matching what a real terminal sends — not the `\n` a submitted command gets). |
+| `Esc` | Cancels back to normal input **without sending anything** — use this if the prompt turned out to be a false match (see "Known limitations" below), not a real device waiting on a keystroke. |
+| `Ctrl+C` / `Ctrl+N` / `Ctrl+P` | Still work exactly as usual — the escape hatches above never get swallowed by pagination mode. |
+
 ### Session replay
 
 Play a saved recording back through the same console UI (vendor
@@ -171,6 +185,16 @@ value. Every history file is created `0600`.
 
 ## Known limitations
 
+- Pagination-prompt detection (see "Pagination (`--More--`) support" above)
+  is a plain substring match against unterminated device output, checked
+  generically rather than per-vendor — deliberately so, since it must work
+  even before a vendor is detected (a long banner can itself page, and the
+  device would otherwise be permanently stuck waiting for a keystroke
+  detection can never arrive to unblock). The tradeoff: if `--More--` (or
+  one of the other markers) ever appears as literal text inside ordinary,
+  non-paginated output with no trailing newline yet, ttyt will switch to
+  pagination mode on a false match. `Esc` cancels back to normal input
+  without sending anything if this happens.
 - Vendor detection scans up to 40 lines after connect looking for a known
   banner; if none of the plugins match in that window, vendor status
   becomes `Unknown` rather than continuing to scan indefinitely. Fortinet

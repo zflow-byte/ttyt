@@ -89,6 +89,16 @@ pub(crate) enum Mode {
     /// match into `input` without submitting it, same principle as
     /// history search and TAB-autocomplete.
     Palette(PaletteState),
+    /// A `--More--`-style pagination prompt arrived (`SessionEvent::
+    /// PaginationPrompt`): the device is blocked waiting for exactly one
+    /// keystroke, not a submitted line. Every key except Esc converts
+    /// straight to a raw byte via `on_key_in_pagination` instead of going
+    /// through `input`/`pending_submit` -- Esc cancels back to `Normal`
+    /// without sending anything, a deliberate escape hatch for the case
+    /// where the marker match was a false positive (e.g. the literal
+    /// text `--More--` inside a banner) and the device isn't actually
+    /// waiting for a keystroke at all.
+    Pagination,
 }
 
 /// One connection/tab's worth of UI state. `App` owns a `Vec<Session>`;
@@ -146,6 +156,10 @@ pub struct Session {
     pub hint: Option<String>,
     pub disconnect_requested: bool,
     pending_submit: Option<String>,
+    /// Set by `on_key_in_pagination` when a keystroke should go straight
+    /// to the device as a single raw byte instead of through the normal
+    /// `input`/`pending_submit` line-submission path.
+    pending_raw_key: Option<u8>,
 }
 
 impl Session {
@@ -168,6 +182,7 @@ impl Session {
             hint: None,
             disconnect_requested: false,
             pending_submit: None,
+            pending_raw_key: None,
         }
     }
 
@@ -213,12 +228,26 @@ impl Session {
                 // cycle through a list that no longer matches reality.
                 self.tab_cycle = None;
             }
+            SessionEvent::PaginationPrompt(prompt) => {
+                // Shown in scrollback like any other output line, then
+                // the very next keystroke goes straight to the device
+                // instead of through the normal input line -- entering
+                // this mode discards whatever else was open, same
+                // principle Ctrl+R/Ctrl+P already use.
+                self.push_line(prompt);
+                self.mode = Mode::Pagination;
+            }
         }
     }
 
     /// Takes the line submitted by the most recent Enter keypress, if any.
     pub fn take_pending_submit(&mut self) -> Option<String> {
         self.pending_submit.take()
+    }
+
+    /// Takes the single raw byte queued by `on_key_in_pagination`, if any.
+    pub fn take_pending_raw_key(&mut self) -> Option<u8> {
+        self.pending_raw_key.take()
     }
 
     /// ESC's behavior in `Mode::Normal` (the other modes handle their own
@@ -264,6 +293,10 @@ impl Session {
             }
             Mode::Palette(_) => {
                 self.on_key_in_palette(key);
+                return;
+            }
+            Mode::Pagination => {
+                self.on_key_in_pagination(key);
                 return;
             }
             Mode::Normal => {}
@@ -314,6 +347,29 @@ impl Session {
             self.pending_submit = Some(cmd);
         }
         // else: declined -- mode is already Normal, cmd is dropped.
+    }
+
+    /// Key handling while `mode` is `Pagination`: converts the keystroke
+    /// straight to a single raw byte for `ConnectionHandle::write_raw`
+    /// rather than the normal input-line-then-Enter path, since the device
+    /// is blocked on a `--More--`-style prompt waiting for exactly one
+    /// keystroke. `Enter` sends `\r` (0x0D), matching what a real terminal
+    /// sends for that key -- `write_line`'s `\n` would not advance paging
+    /// on every vendor. Esc is the one key that does *not* pass through:
+    /// it cancels back to `Normal` with nothing sent, the escape hatch for
+    /// a false-positive marker match (e.g. `--More--` appearing literally
+    /// inside a banner) where the device was never actually waiting on a
+    /// keystroke. Any other non-ASCII key (arrows, function keys, ...) is
+    /// dropped the same way -- there's no sensible single byte to send.
+    fn on_key_in_pagination(&mut self, key: KeyEvent) {
+        self.mode = Mode::Normal;
+        let byte = match key.code {
+            KeyCode::Esc => None,
+            KeyCode::Enter => Some(b'\r'),
+            KeyCode::Char(c) if c.is_ascii() => Some(c as u8),
+            _ => None,
+        };
+        self.pending_raw_key = byte;
     }
 
     /// TAB: completes `input` from `suggestions`, inserting into the
@@ -376,7 +432,7 @@ impl Session {
         }
         match &mut self.mode {
             Mode::HistorySearch(search) => search.match_index += 1,
-            Mode::Normal | Mode::ConfirmSend(_) | Mode::Palette(_) => {
+            Mode::Normal | Mode::ConfirmSend(_) | Mode::Palette(_) | Mode::Pagination => {
                 self.mode = Mode::HistorySearch(HistorySearchState::default())
             }
         }
@@ -394,7 +450,7 @@ impl Session {
         }
         match &mut self.mode {
             Mode::Palette(state) => state.index += 1,
-            Mode::Normal | Mode::ConfirmSend(_) | Mode::HistorySearch(_) => {
+            Mode::Normal | Mode::ConfirmSend(_) | Mode::HistorySearch(_) | Mode::Pagination => {
                 self.mode = Mode::Palette(PaletteState::default())
             }
         }
@@ -527,6 +583,10 @@ impl Session {
         matches!(self.mode, Mode::ConfirmSend(_))
     }
 
+    pub(crate) fn is_pagination_active(&self) -> bool {
+        matches!(self.mode, Mode::Pagination)
+    }
+
     /// What the console pane's input line should display: the normal
     /// `> {input}` prompt, a bash-style `(reverse-i-search)` line while
     /// history search is active, or a y/N confirmation prompt while a
@@ -541,6 +601,9 @@ impl Session {
             Mode::Palette(state) => {
                 let matched = self.current_palette_match(state).unwrap_or("");
                 format!("(palette)`{}': {matched}", state.query)
+            }
+            Mode::Pagination => {
+                "-- More -- press space/Enter to page, q to stop, Esc to cancel".to_string()
             }
             Mode::Normal => format!("> {}", self.input),
         }
@@ -726,16 +789,21 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
 /// inbound nor outbound channel is acted on inside this crate -- that
 /// keeps `ttyt-ui` decoupled from `ttyt-core`'s connection/serial types;
 /// the caller owns every session's `ConnectionHandle` and reacts to both.
-/// `theme` is likewise the caller's choice (`Theme::from_name(&config.theme)`)
-/// rather than hardcoded here, for the same "no `ttyt-core` dependency"
-/// reason -- this crate resolves a theme *name* to a palette, but never
-/// reads `Config` itself.
+/// `raw_key_tx` is the same idea for a single passthrough byte queued by
+/// `Mode::Pagination` (see `Session::take_pending_raw_key`) -- kept as its
+/// own channel rather than folded into `submit_tx`'s `String` payload so
+/// neither call site has to distinguish "a submitted line" from "one raw
+/// byte" inside a shared payload type. `theme` is likewise the caller's
+/// choice (`Theme::from_name(&config.theme)`) rather than hardcoded here,
+/// for the same "no `ttyt-core` dependency" reason -- this crate resolves
+/// a theme *name* to a palette, but never reads `Config` itself.
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     session_events: &mut mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
     submit_tx: mpsc::UnboundedSender<(SessionId, String)>,
     disconnect_tx: mpsc::UnboundedSender<SessionId>,
+    raw_key_tx: mpsc::UnboundedSender<(SessionId, u8)>,
     theme: Theme,
 ) -> std::io::Result<()> {
     let mut key_events = spawn_input_thread(Duration::from_millis(100));
@@ -747,7 +815,7 @@ pub async fn run<B: Backend>(
             key = key_events.recv() => {
                 match key {
                     Some(key) => {
-                        if handle_key_event(app, key, &submit_tx, &disconnect_tx) {
+                        if handle_key_event(app, key, &submit_tx, &disconnect_tx, &raw_key_tx) {
                             return Ok(());
                         }
                     }
@@ -775,6 +843,7 @@ fn handle_key_event(
     key: KeyEvent,
     submit_tx: &mpsc::UnboundedSender<(SessionId, String)>,
     disconnect_tx: &mpsc::UnboundedSender<SessionId>,
+    raw_key_tx: &mpsc::UnboundedSender<(SessionId, u8)>,
 ) -> bool {
     app.on_key(key);
     let session = app.active_session_mut();
@@ -782,6 +851,9 @@ fn handle_key_event(
     if let Some(line) = session.take_pending_submit() {
         session.push_history(line.clone());
         let _ = submit_tx.send((id, line));
+    }
+    if let Some(byte) = session.take_pending_raw_key() {
+        let _ = raw_key_tx.send((id, byte));
     }
     if session.disconnect_requested {
         session.disconnect_requested = false;
@@ -808,12 +880,14 @@ mod tests {
         app.active_session_mut().connection_state = ConnectionState::Connected;
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, mut disconnect_rx) = mpsc::unbounded_channel();
+        let (raw_key_tx, _raw_key_rx) = mpsc::unbounded_channel();
 
         let should_stop = handle_key_event(
             &mut app,
             key(KeyModifiers::CONTROL, KeyCode::Char('c')),
             &submit_tx,
             &disconnect_tx,
+            &raw_key_tx,
         );
 
         assert!(!should_stop);
@@ -833,12 +907,14 @@ mod tests {
         app.active_session_mut().input = "show version".to_string();
         let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+        let (raw_key_tx, _raw_key_rx) = mpsc::unbounded_channel();
 
         handle_key_event(
             &mut app,
             key(KeyModifiers::NONE, KeyCode::Enter),
             &submit_tx,
             &disconnect_tx,
+            &raw_key_tx,
         );
 
         assert_eq!(
@@ -926,6 +1002,105 @@ mod tests {
              tab must not tear down the whole app"
         );
         assert!(!app.active_session().disconnect_requested);
+    }
+
+    #[test]
+    fn pagination_prompt_event_pushes_to_scrollback_and_enters_pagination_mode() {
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        assert_eq!(
+            app.active_session().scrollback.back().map(String::as_str),
+            Some("--More--"),
+            "the prompt text should be visible in scrollback like any other output"
+        );
+        assert!(app.active_session().is_pagination_active());
+    }
+
+    #[test]
+    fn space_key_in_pagination_mode_queues_a_raw_space_byte_and_exits_the_mode() {
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char(' ')));
+        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b' '));
+        assert!(!app.active_session().is_pagination_active());
+    }
+
+    #[test]
+    fn enter_key_in_pagination_mode_queues_carriage_return_not_linefeed() {
+        // A real terminal responding to `--More--` sends '\r' for Enter,
+        // not the '\n' write_line appends for a submitted command -- some
+        // vendors don't treat '\n' as advancing the page.
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b'\r'));
+    }
+
+    #[test]
+    fn q_key_in_pagination_mode_queues_the_literal_byte() {
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('q')));
+        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b'q'));
+    }
+
+    #[test]
+    fn esc_in_pagination_mode_cancels_without_queuing_any_byte() {
+        // The escape hatch for a false-positive marker match (e.g. the
+        // literal text "--More--" inside a banner): the device was never
+        // actually waiting on a keystroke, so nothing should be sent.
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
+        assert_eq!(app.active_session_mut().take_pending_raw_key(), None);
+        assert!(!app.active_session().is_pagination_active());
+    }
+
+    #[test]
+    fn ctrl_c_still_disconnects_while_pagination_mode_is_active() {
+        // Ctrl+C must stay reachable even during pagination passthrough --
+        // otherwise a false-positive marker match would leave the user
+        // with no way out except typing a byte straight at a production
+        // device. Mirrors the same escape-hatch guarantee already proven
+        // for history search/confirm-send/palette.
+        let mut app = App::new();
+        app.active_session_mut().connection_state = ConnectionState::Connected;
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+        assert!(app.active_session().disconnect_requested);
+        assert!(!app.active_session().is_pagination_active());
+    }
+
+    #[test]
+    fn input_line_display_shows_the_pagination_hint_while_active() {
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        assert!(
+            app.active_session()
+                .input_line_display()
+                .starts_with("-- More --")
+        );
     }
 
     #[test]
@@ -1321,12 +1496,14 @@ mod tests {
         app.active_session_mut().input = "show version".to_string();
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
+        let (raw_key_tx, _raw_key_rx) = mpsc::unbounded_channel();
 
         handle_key_event(
             &mut app,
             key(KeyModifiers::NONE, KeyCode::Enter),
             &submit_tx,
             &disconnect_tx,
+            &raw_key_tx,
         );
 
         assert_eq!(

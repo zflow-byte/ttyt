@@ -107,6 +107,14 @@ pub async fn run(
                     tracing::error!(error = %e, "failed to write session log line");
                 }
             }
+            Ok(SessionEvent::PaginationPrompt(prompt)) => {
+                // Real device output, same as a RawLine -- recorded (and
+                // subject to the same redaction) so the transcript shows
+                // that pagination happened here, not just a silent gap.
+                if let Err(e) = recorder.record_line(&prompt) {
+                    tracing::error!(error = %e, "failed to write session log line");
+                }
+            }
             Ok(SessionEvent::ConnectionStateChanged(state)) => {
                 // Not sensitive -- recorded as-is, not passed through the
                 // redactor, so the transcript shows exactly when the link
@@ -147,7 +155,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::config::Config;
-    use crate::events::LineAssembler;
+    use crate::events::{AssembledOutput, LineAssembler};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -224,16 +232,27 @@ mod tests {
         // assembler -- never raw byte chunks -- otherwise a password
         // split mid-keyword across reads would never match the pattern.
         let mut assembler = LineAssembler::new();
-        assert_eq!(assembler.feed(b"username admin "), Vec::<String>::new());
-        assert_eq!(assembler.feed(b"password Sup"), Vec::<String>::new());
-        let lines = assembler.feed(b"erSecret1\r\n");
         assert_eq!(
-            lines,
-            vec!["username admin password SuperSecret1".to_string()]
+            assembler.feed(b"username admin "),
+            Vec::<AssembledOutput>::new()
         );
+        assert_eq!(
+            assembler.feed(b"password Sup"),
+            Vec::<AssembledOutput>::new()
+        );
+        let output = assembler.feed(b"erSecret1\r\n");
+        assert_eq!(
+            output,
+            vec![AssembledOutput::Line(
+                "username admin password SuperSecret1".to_string()
+            )]
+        );
+        let AssembledOutput::Line(line) = &output[0] else {
+            panic!("expected a Line variant");
+        };
 
         let redactor = Redactor::new(&Config::default().redaction_patterns).unwrap();
-        let redacted = redactor.redact(&lines[0]);
+        let redacted = redactor.redact(line);
         assert_eq!(redacted, "[REDACTED]");
     }
 

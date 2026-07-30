@@ -1,6 +1,6 @@
 mod line_assembler;
 
-pub use line_assembler::LineAssembler;
+pub use line_assembler::{AssembledOutput, LineAssembler};
 
 use crate::model::{ParsedEvent, PromptInfo, VendorDetectionStatus};
 
@@ -58,6 +58,12 @@ pub enum SessionEvent {
     /// logic, and the design doc keeps all vendor logic in
     /// `ttyt-core`, reached by the UI only through bus events.
     Suggestions(Vec<String>),
+    /// The device is blocked on a "press a key to continue" pagination
+    /// prompt (`--More--` and vendor equivalents), recognized from an
+    /// unterminated buffer tail by a [`LineAssembler`]. Carries the raw
+    /// prompt text so it can still be shown in the console like any other
+    /// output line.
+    PaginationPrompt(String),
 }
 
 /// A single-producer, multi-consumer fan-out for `SessionEvent`s. Every

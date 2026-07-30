@@ -13,12 +13,14 @@ const HISTORY_SEARCH_HINT: &str =
     "history search: type to filter, Ctrl+R again for older match, Enter to accept, Esc to cancel";
 const CONFIRM_SEND_HINT: &str = "dangerous command -- press 'y' to send it, any other key cancels";
 const PALETTE_HINT: &str = "command palette: type to fuzzy-filter, Ctrl+P again for next match, Enter to accept, Esc to cancel";
+const PAGINATION_HINT: &str =
+    "-- More -- press space/Enter to page through, q to stop, Esc if this is a false match";
 
 /// Bottom-left: parsed events (errors/warnings/link/hostname changes),
 /// most recent visible. Bottom-right: hints -- overlay usage while one is
-/// active (confirm-send / history search / palette, in that priority
-/// order since at most one can really be true), else the most recent
-/// hint from a key press, else the static keybinding legend.
+/// active (confirm-send / history search / palette / pagination, in that
+/// priority order since at most one can really be true), else the most
+/// recent hint from a key press, else the static keybinding legend.
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -38,6 +40,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         HISTORY_SEARCH_HINT
     } else if session.is_palette_active() {
         PALETTE_HINT
+    } else if session.is_pagination_active() {
+        PAGINATION_HINT
     } else {
         session.hint.as_deref().unwrap_or(KEYBINDING_LEGEND)
     };

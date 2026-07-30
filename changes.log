@@ -472,3 +472,77 @@ clean: 222 tests (152 core + 67 ui + 3 cli). Formula/ttyt.rb's `url`/
 `sha256` updated to point at the real v0.1.1 tarball -- v0.1.0 remains
 tagged in git history as the record of what was actually reviewed and
 published first, not deleted or force-moved.
+
+**Real hardware gap found and fixed in v0.1.2: `--More--`/pagination
+support.** Testing against real device output surfaced a case worse than
+"the UI doesn't handle it": `LineAssembler::feed` only ever emitted
+content terminated by `\n`, and a `--More--`-style prompt never sends
+one -- the device blocks waiting for a single keystroke, so that content
+sat invisibly in the assembler's internal buffer, only ever surfacing via
+`flush()` on disconnect. Separately, `Session::on_key`'s Enter handler was
+a no-op when `input` was empty, so a bare Enter (which a user might try,
+thinking it pages through) sent nothing at all -- the session looked
+hung with no way to tell what was going on.
+
+Fixed with full interactive support (the more invasive of two options
+considered; the alternative -- auto-disabling pagination on connect via
+vendor `terminal length 0`-style commands -- was rejected in favor of
+handling the real prompt):
+
+- `LineAssembler::feed` now returns `Vec<AssembledOutput>`
+  (`Line`/`PaginationPrompt`) instead of `Vec<String>`. After draining
+  complete lines, the remaining unterminated buffer is checked against a
+  small set of known markers (`--More--` for Cisco/Dell OS10/Aruba CX,
+  `---- More ----` for Comware, `---(more` as a prefix match for JunOS's
+  `---(more N%)---` variants) and drained on match rather than left to
+  mangle into the next line once a newline eventually arrives. Detection
+  is deliberately generic/vendor-agnostic rather than routed through
+  `VendorPlugin`: a long banner can itself page before vendor detection
+  finishes, and if detection had to run first that would be a permanent
+  deadlock (the device is stuck waiting for a keystroke detection could
+  never unblock).
+- New `SessionEvent::PaginationPrompt(String)`; `reader_loop` publishes it
+  instead of `RawLine` when the assembler recognizes a marker. Recorded to
+  the session transcript the same as any other output line (subject to
+  the same redaction); the detector explicitly ignores it (nothing to
+  classify).
+- New `ConnectionHandle::write_raw(byte: u8)`, sharing `write_line`'s
+  `write_pending` wrapping so this path doesn't reintroduce the
+  reader/writer starvation that wrapping was originally added to fix --
+  sends exactly one byte, no trailing newline.
+- New `ttyt-ui` `Mode::Pagination`: entered when a `PaginationPrompt`
+  event arrives (pushed to scrollback first, same as any other output),
+  and every keystroke while active converts straight to a raw byte
+  instead of going through `input`/`pending_submit` -- `Enter` sends
+  `\r` (matching a real terminal, not `write_line`'s `\n`, which doesn't
+  advance paging on every vendor), `Esc` cancels back to `Normal` with
+  nothing sent. `Ctrl+C`/`Ctrl+N`/`Ctrl+R`/`Ctrl+P` all stay reachable
+  during pagination mode exactly as they already are for the other three
+  modes -- deliberately, since the marker match is a plain substring
+  check and a false positive (e.g. `--More--` appearing as literal text
+  in a banner) would otherwise leave the next keystroke injected as a
+  raw byte into a production device with no way out.
+- New dedicated `raw_key_tx` channel through `ttyt_ui::run` alongside
+  `submit_tx`/`disconnect_tx` (not folded into `submit_tx`'s `String`
+  payload, so neither call site has to distinguish a submitted line from
+  a raw byte inside a shared type); `commands.rs`'s `connect()` forwards
+  it to `ConnectionHandle::write_raw`, `replay()` drains and discards it
+  (no live device to write to, same as the other two channels there).
+
+Verified end-to-end over a real PTY pair (no interactive keyboard/TTY
+available in this environment to drive the actual binary the way a human
+would over `socat`, so this is the same real-OS-file-descriptor proof the
+existing `real_pty_bytes_flow_through_to_raw_line_events` test already
+uses, extended through the write path):
+`real_pty_more_prompt_and_raw_key_response_round_trip` writes an
+unterminated `--More--` into one side of the pair, confirms the
+`PaginationPrompt` event, calls `write_raw(b' ')`, and confirms the other
+side receives exactly that one byte -- nothing else, no newline.
+
+Full fmt/clippy -D warnings/test clean: 237 tests (160 core + 74 ui + 3
+cli), up from 222 in v0.1.1. README documents the new pagination
+behavior (keybindings + a "Known limitations" note on the substring-match
+false-positive tradeoff). Bumped workspace version 0.1.1 -> 0.1.2
+(Cargo.toml + Cargo.lock), tagged and pushed `v0.1.2`; Formula/ttyt.rb's
+`url`/`sha256` updated to point at the real v0.1.2 tarball in both this
+repo and the published tap (github.com/zflow-byte/homebrew-ttyt).
