@@ -14,7 +14,7 @@ pub use error::CoreError;
 pub use events::{ConnectionState, EventBus, SessionEvent, SessionId};
 pub use model::{DetectionResult, ParsedEvent, PromptInfo, PromptMode, VendorDetectionStatus};
 pub use plugin::{
-    ArubaCxPlugin, CiscoPlugin, ComwarePlugin, DellOs10Plugin, JunosPlugin, PluginRegistry,
-    VendorPlugin,
+    ArubaCxPlugin, CiscoPlugin, ComwarePlugin, DellOs10Plugin, FortinetPlugin, JunosPlugin,
+    PluginRegistry, VendorPlugin,
 };
 pub use session::{CommandHistory, DangerousCommandGuard, Redactor, SessionRecorder};

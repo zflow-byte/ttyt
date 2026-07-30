@@ -3,12 +3,14 @@ mod cisco;
 pub(crate) mod common;
 mod comware;
 mod dell_os10;
+mod fortinet;
 mod junos;
 
 pub use aruba_cx::ArubaCxPlugin;
 pub use cisco::CiscoPlugin;
 pub use comware::ComwarePlugin;
 pub use dell_os10::DellOs10Plugin;
+pub use fortinet::FortinetPlugin;
 pub use junos::JunosPlugin;
 
 use crate::model::{DetectionResult, ParsedEvent, PromptInfo};
@@ -64,7 +66,12 @@ impl PluginRegistry {
     }
 
     /// All vendor plugins implemented so far, compiled in. Phase 1: Cisco
-    /// only. Phase 2 adds Dell OS10 / Aruba CX / Comware / JunOS here.
+    /// only. Phase 2 adds Dell OS10 / Aruba CX / Comware / JunOS.
+    /// Fortinet (Task 3.10) is a recognition-only stub -- see
+    /// `FortinetPlugin`'s doc comment -- and is registered **last**
+    /// because it matches on a loose banner token rather than a
+    /// structural format; first-match-wins order must never let it shadow
+    /// a real vendor.
     pub fn with_default_plugins() -> Self {
         PluginRegistry::new(vec![
             Box::new(CiscoPlugin),
@@ -72,6 +79,7 @@ impl PluginRegistry {
             Box::new(JunosPlugin),
             Box::new(DellOs10Plugin),
             Box::new(ArubaCxPlugin),
+            Box::new(FortinetPlugin),
         ])
     }
 
@@ -126,10 +134,14 @@ mod tests {
     /// (incorrectly) matching a different vendor's banner, which is
     /// exactly the failure mode that would silently misclassify a real
     /// device. This test checks every (plugin, other vendor's banner)
-    /// pair across all five registered plugins.
+    /// pair across all six registered plugins. Fortinet is included even
+    /// though it's a recognition-only stub (Task 3.10): its loose
+    /// token-based `detect` is exactly the kind of match most likely to
+    /// accidentally fire on another vendor's banner, so it needs this
+    /// cross-check at least as much as the fully-implemented plugins do.
     #[test]
     fn no_plugin_detects_another_vendors_banner_fixture() {
-        let fixtures: [(&str, &str); 5] = [
+        let fixtures: [(&str, &str); 6] = [
             ("cisco-ios", "Cisco IOS Software, Version 15.2(2)E7"),
             (
                 "comware",
@@ -147,6 +159,7 @@ mod tests {
                 "aruba-cx",
                 "Aruba Operating System (ArubaOS-CX)\nVersion : 10.09.0010",
             ),
+            ("fortinet", "FortiGate-60E v7.0.5,build0304,220401 (GA)"),
         ];
 
         let registry = PluginRegistry::with_default_plugins();
