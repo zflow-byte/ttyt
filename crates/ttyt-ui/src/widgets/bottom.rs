@@ -15,12 +15,17 @@ const CONFIRM_SEND_HINT: &str = "dangerous command -- press 'y' to send it, any 
 const PALETTE_HINT: &str = "command palette: type to fuzzy-filter, Ctrl+P again for next match, Enter to accept, Esc to cancel";
 const PAGINATION_HINT: &str =
     "-- More -- press space/Enter to page through, q to stop, Esc if this is a false match";
+const RAW_MODE_HINT: &str =
+    "raw passthrough -- every key goes straight to the device (this tab only), Ctrl+T to exit";
 
 /// Bottom-left: parsed events (errors/warnings/link/hostname changes),
-/// most recent visible. Bottom-right: hints -- overlay usage while one is
-/// active (confirm-send / history search / palette / pagination, in that
-/// priority order since at most one can really be true), else the most
-/// recent hint from a key press, else the static keybinding legend.
+/// most recent visible. Bottom-right: hints -- raw passthrough mode takes
+/// priority over everything else (while it's active, `Mode` reflects
+/// whatever it was before/during raw mode and isn't driving actual key
+/// dispatch, see `App::on_key`'s doc comment), then overlay usage while
+/// one is active (confirm-send / history search / palette / pagination, in
+/// that priority order since at most one can really be true), else the
+/// most recent hint from a key press, else the static keybinding legend.
 pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -34,7 +39,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(" Hints ");
-    let hints_body = if session.is_confirm_send_active() {
+    let hints_body = if session.is_raw_mode_active() {
+        RAW_MODE_HINT
+    } else if session.is_confirm_send_active() {
         CONFIRM_SEND_HINT
     } else if session.is_history_search_active() {
         HISTORY_SEARCH_HINT

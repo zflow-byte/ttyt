@@ -163,7 +163,8 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
     let mut terminal = ttyt_ui::terminal::init()?;
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, String)>();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
-    let (raw_key_tx, mut raw_key_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, u8)>();
+    let (raw_key_tx, mut raw_key_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SessionId, Vec<u8>)>();
 
     let ui_result = {
         let mut ui_future = Box::pin(ttyt_ui::run(
@@ -187,13 +188,14 @@ pub async fn connect(ports: Vec<String>, baud: Option<u32>) -> anyhow::Result<()
                         tracing::error!(error = %e, "failed to write to device");
                     }
                 }
-                Some((id, byte)) = raw_key_rx.recv() => {
+                Some((id, bytes)) = raw_key_rx.recv() => {
                     // Single-keystroke passthrough for a --More---style
-                    // pagination prompt: not a submitted command, so no
-                    // history entry, just the raw byte straight to the
-                    // device (see Mode::Pagination / write_raw's doc
+                    // pagination prompt, or every keystroke while raw
+                    // passthrough mode is active: not a submitted command,
+                    // so no history entry, just the raw bytes straight to
+                    // the device (see Mode::Pagination / write_raw's doc
                     // comments for why this needs its own path).
-                    if let Err(e) = handles[id.index()].connection.write_raw(byte).await {
+                    if let Err(e) = handles[id.index()].connection.write_raw(&bytes).await {
                         tracing::error!(error = %e, "failed to write raw key to device");
                     }
                 }
@@ -289,7 +291,8 @@ pub async fn replay(path: PathBuf, speed: f64) -> anyhow::Result<()> {
     let mut terminal = ttyt_ui::terminal::init()?;
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, String)>();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
-    let (raw_key_tx, mut raw_key_rx) = tokio::sync::mpsc::unbounded_channel::<(SessionId, u8)>();
+    let (raw_key_tx, mut raw_key_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SessionId, Vec<u8>)>();
 
     let ui_result = {
         let mut ui_future = Box::pin(ttyt_ui::run(

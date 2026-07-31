@@ -766,3 +766,97 @@ Full fmt/clippy -D warnings/test clean: 250 tests (163 core + 84 ui + 3
 cli), up from 246 in v0.1.5. Bumped workspace version 0.1.5 -> 0.1.6,
 tagged and pushed `v0.1.6`; Formula/ttyt.rb's `url`/`sha256` updated to
 point at the real v0.1.6 tarball in both this repo and the published tap.
+
+**Raw passthrough mode (`Ctrl+T`), v0.1.7.** User confirmed v0.1.6's fix,
+then asked for `ttyt` to behave like `screen` for the parts of a session
+that don't fit its normal type-then-Enter model: connecting to a device
+and not being able to tell what state the session is in, a username not
+appearing as typed, Enter not working "like screen." Root cause: ttyt's
+input line buffers what's typed until Enter, which doesn't match a raw
+terminal's turn-by-turn echo for logins/confirmations/anything not
+line-oriented. Clarified scope with the user (two rounds of questions)
+before implementing: a mode toggled on/off manually at any time (not
+auto-triggered for login only, not a full replacement of the buffered
+model -- TAB-complete/palette/history/dangerous-command-guard stay
+available outside it), with the bottom input line showing only a bare
+`-- RAW --` state label while active, no buffered text.
+
+`Ctrl+T` toggles a new `Session::raw_mode_active` flag -- deliberately
+*not* another `Mode` enum variant, since `Mode::Pagination`'s existing
+"convert this one keystroke to a byte" behavior would otherwise overlap
+and conflict with it (a `--More--` prompt arriving mid-raw-mode already
+sets `mode = Mode::Pagination` for its scrollback push side effect; raw
+mode ignores this and is reset back to `Mode::Normal` on exit so it can't
+surface as a stale overlay once normal dispatch resumes). While active,
+every keystroke is converted straight to bytes and queued through the
+same `pending_raw_bytes`/`raw_key_tx` channel `Mode::Pagination` already
+used (renamed from `pending_raw_key: Option<u8>` to
+`pending_raw_bytes: Option<Vec<u8>>` to carry multi-byte sequences, e.g.
+`\x1b[A` for Up-arrow, needed for device-side command-history
+navigation) -- but unlike pagination, it does *not* exit after one
+keystroke; only `Ctrl+T` turns it off.
+
+Passthrough is total by design, not partial: every other key --
+including `Ctrl+C`, `Ctrl+N`, `Ctrl+P`, `Ctrl+R`, all normally intercepted
+globally in `App::on_key`/`Session::on_key` before any mode ever sees
+them -- is sent to the device instead of triggering ttyt's own shortcut
+while raw mode is active. This is a deliberate reversal of the existing
+"global keys always stay reachable" principle: many device CLIs bind
+these themselves (Ctrl+C to abort a running command, Ctrl+N/Ctrl+P for
+history), and a raw passthrough mode that silently swallowed them would
+not actually behave like `screen`. `App::on_key` now checks the `Ctrl+T`
+toggle and the raw-mode flag *before* its existing Ctrl+C/Ctrl+N checks
+and before dispatching into `Session::on_key` at all, so nothing else
+gets a chance to intercept first. A real correctness bug caught before
+shipping: crossterm reports `Ctrl+C` as `Char('c')` with the CONTROL
+modifier set, not as a distinct keycode -- an early version of
+`on_key_in_raw` would have sent the literal byte `c` (0x63) instead of
+ETX (0x03) for every Ctrl+letter combo passed through. Fixed by detecting
+the CONTROL modifier on an ASCII letter and computing the real control
+byte (`Ctrl+A` = 0x01 ... `Ctrl+Z` = 0x1A) instead.
+
+`ConnectionHandle::write_raw` widened from `write_raw(byte: u8)` to
+`write_raw(bytes: &[u8])` to carry these multi-byte sequences through the
+same "no starvation" `write_pending` wrapping `write_line` already uses --
+mechanical, all call sites updated, single-byte pagination use unaffected.
+
+Two gaps found and fixed after a design review before release, neither
+caught by the first pass of tests: (1) `raw_mode_active` was only ever
+cleared by another `Ctrl+T`, so a connection dropping while raw mode was
+active left the input line reading `-- RAW --` on a dead session with
+every keystroke queuing bytes for a `write_raw` that could only fail --
+the exact "can't tell what state I'm in" complaint this feature exists to
+fix, reintroduced by omission. Fixed by clearing it in the same
+`ConnectionStateChanged(Disconnected | Reconnecting)` arm that already
+clears `partial_output`, same reasoning. (2) No test proved
+`raw_mode_active` was genuinely per-session rather than accidentally
+shared/global-feeling behavior across tabs -- added one that toggles it
+on tab 1, switches focus to tab 0, and asserts tab 0 never entered it.
+
+A CLI-level interactive smoke test (real keystrokes driving the actual
+`ttyt` binary via `expect`, against a `socat`-created virtual serial
+pair) was attempted but blocked: `serialport::new(...).open()` calls
+termios/baud ioctls a generic `socat` PTY doesn't support on this
+platform (`ENOTTY`) -- a tooling limitation, not a defect in this
+feature; the project's existing real-PTY tests all use
+`serialport::TTYPort::pair()` instead, which is fully compatible.
+Substituted a real-PTY round-trip test at the `ttyt-core` connection
+layer (`real_pty_multi_byte_raw_write_round_trips_intact`, mirroring the
+existing single-byte pagination round-trip test) proving the widened
+`write_raw(&[u8])` delivers a genuine 3-byte escape sequence to the other
+side of an actual OS file descriptor, in order, in one write. Every
+keybinding/mode-transition behavior (toggle on/off, per-keystroke byte
+conversion for chars/Enter/Backspace/Tab/Esc/arrows, Ctrl+letter control
+bytes, passthrough of Ctrl+C/N/P/R, disconnect clearing the flag,
+per-session isolation) is covered by 13 new `ttyt-ui` unit tests instead.
+**Not yet verified against real hardware** -- in particular, whether `\r`
+(what raw mode sends for Enter) is what was actually missing for "enter
+เหมือน screen ไม่ได้," versus `\r\n` -- ask the user to report back
+specifically whether Enter now submits correctly at a raw-mode login
+prompt; if it still doesn't, that points at needing `\r\n` instead of
+`\r`, not at raw mode itself.
+
+Full fmt/clippy -D warnings/test clean: 265 tests (165 core + 97 ui + 3
+cli), up from 250 in v0.1.6. Bumped workspace version 0.1.6 -> 0.1.7,
+tagged and pushed `v0.1.7`; Formula/ttyt.rb's `url`/`sha256` updated to
+point at the real v0.1.7 tarball in both this repo and the published tap.

@@ -108,14 +108,14 @@ impl ConnectionHandle {
         self.write_bytes(bytes).await
     }
 
-    /// Write a single raw byte to the device with no newline appended --
-    /// e.g. a bare space, `\r`, or `q` in response to a `--More--`-style
-    /// pagination prompt, where the device is waiting for exactly one
-    /// keystroke rather than a submitted line. Shares `write_line`'s
+    /// Write raw bytes to the device with nothing appended -- e.g. a bare
+    /// space, `\r`, or `q` in response to a `--More--`-style pagination
+    /// prompt (a single byte), or a multi-byte ANSI escape sequence for an
+    /// arrow key in raw passthrough mode. Shares `write_line`'s
     /// `write_pending` wrapping so this path doesn't reintroduce the
     /// reader/writer starvation `write_line` was fixed for.
-    pub async fn write_raw(&self, byte: u8) -> Result<(), CoreError> {
-        self.write_bytes(vec![byte]).await
+    pub async fn write_raw(&self, bytes: &[u8]) -> Result<(), CoreError> {
+        self.write_bytes(bytes.to_vec()).await
     }
 
     async fn write_bytes(&self, bytes: Vec<u8>) -> Result<(), CoreError> {
@@ -400,7 +400,7 @@ mod tests {
             Err(CoreError::Config("no reopen in this test".to_string()))
         });
 
-        handle.write_raw(b' ').await.unwrap();
+        handle.write_raw(b" ").await.unwrap();
 
         let written = writes_rx
             .recv_timeout(Duration::from_secs(1))
@@ -410,6 +410,34 @@ mod tests {
             vec![b' '],
             "write_raw must send exactly the one byte, no trailing newline"
         );
+
+        handle.disconnect();
+    }
+
+    #[tokio::test]
+    async fn write_raw_forwards_a_multi_byte_sequence_intact() {
+        // Raw passthrough mode sends a full ANSI escape sequence for an
+        // arrow key (e.g. `\x1b[A` for Up) in one write_raw call -- must
+        // arrive at the transport as one write, byte order preserved, not
+        // split into three single-byte writes or reordered.
+        let (writes_tx, writes_rx) = mpsc::channel();
+        let transport = MockTransport {
+            reads: std::collections::VecDeque::new(),
+            writes_tx,
+            idle_sleep: Duration::from_millis(5),
+        };
+        let bus = Arc::new(EventBus::new(16));
+
+        let mut handle = ConnectionHandle::spawn(Box::new(transport), bus, || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        handle.write_raw(&[0x1b, b'[', b'A']).await.unwrap();
+
+        let written = writes_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write should have been forwarded to the transport");
+        assert_eq!(written, vec![0x1b, b'[', b'A']);
 
         handle.disconnect();
     }
@@ -726,7 +754,7 @@ mod tests {
 
         // Respond as the UI would on a space keypress in Mode::Pagination.
         handle
-            .write_raw(b' ')
+            .write_raw(b" ")
             .await
             .expect("write_raw should succeed");
 
@@ -745,6 +773,58 @@ mod tests {
             received,
             vec![b' '],
             "the device side must receive exactly the one raw byte, nothing else"
+        );
+
+        handle.disconnect();
+    }
+
+    /// Same real-PTY round trip as above, but for the multi-byte case raw
+    /// passthrough mode introduces: an arrow key's full ANSI escape
+    /// sequence. Proves `write_raw`'s widened `&[u8]` signature delivers
+    /// all three bytes to the other side of a genuine OS file descriptor,
+    /// in order, in one write -- not just against the in-memory
+    /// `MockTransport` the unit test above already covers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_multi_byte_raw_write_round_trips_intact() {
+        let (mut controller, device_side) =
+            serialport::TTYPort::pair().expect("failed to allocate a PTY pair for this test");
+        let device_side: Box<dyn serialport::SerialPort> = Box::new(device_side);
+        let device_side: Box<dyn SerialTransport> = Box::new(device_side);
+
+        let bus = Arc::new(EventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let mut handle = ConnectionHandle::spawn(device_side, Arc::clone(&bus), || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Connected)
+        );
+
+        // Respond as raw passthrough mode would on an Up-arrow keypress.
+        handle
+            .write_raw(&[0x1b, b'[', b'A'])
+            .await
+            .expect("write_raw should succeed");
+
+        let received = tokio::task::spawn_blocking(move || {
+            use serialport::SerialPort;
+            controller
+                .set_timeout(Duration::from_secs(2))
+                .expect("set_timeout should succeed on a PTY controller");
+            let mut buf = [0u8; 64];
+            let n = std::io::Read::read(&mut controller, &mut buf).unwrap_or(0);
+            buf[..n].to_vec()
+        })
+        .await
+        .expect("blocking read of the PTY controller should not panic");
+        assert_eq!(
+            received,
+            vec![0x1b, b'[', b'A'],
+            "all three bytes of the escape sequence must arrive together, in order"
         );
 
         handle.disconnect();

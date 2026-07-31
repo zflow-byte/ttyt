@@ -118,6 +118,7 @@ Keybindings inside the console:
 | `Ctrl+P` | Open the command palette: fuzzy-filter over this mode's TAB-suggestions plus recent history, `Ctrl+P` again cycles to the next match, Enter accepts the match into the input line (does **not** submit it), Esc cancels. |
 | `Ctrl+L` | Clear the console scrollback. |
 | `Ctrl+R` | Reverse history search (bash `reverse-i-search` style): repeated presses cycle to older matches, typing filters, Enter accepts the match into the input line (does **not** submit it), Esc cancels. |
+| `Ctrl+T` | Toggle raw passthrough mode (see "Raw passthrough mode" below). |
 | `TAB`    | Autocomplete the input line from the current vendor mode's suggestion table; a second consecutive press cycles to the next candidate. Never auto-submits. |
 | `ESC`    | Clears the input line if it has anything typed; otherwise shows a hint. Also cancels an active history search or command palette. |
 | `Enter`  | Submit the input line. If it matches a configured dangerous-command pattern (`reload`, `write erase`, `shutdown`, ...), asks for a plain `y`/`Y` confirmation first instead of sending it immediately — any other key declines and drops it. |
@@ -153,6 +154,33 @@ type-then-Enter flow:
 | `Space` / `Enter` / `q` / any other character | Sent to the device immediately as that one raw byte (`Enter` sends `\r`, matching what a real terminal sends — not the `\n` a submitted command gets). |
 | `Esc` | Cancels back to normal input **without sending anything** — use this if the prompt turned out to be a false match (see "Known limitations" below), not a real device waiting on a keystroke. |
 | `Ctrl+C` / `Ctrl+N` / `Ctrl+P` | Still work exactly as usual — the escape hatches above never get swallowed by pagination mode. |
+
+### Raw passthrough mode
+
+`Ctrl+T` toggles raw passthrough mode: every keystroke is sent to the
+device immediately as a raw byte, instead of being typed into the input
+line and submitted with Enter. This is for the part of a session that
+doesn't behave like a line-oriented CLI — a login prompt, a `y/n` confirm,
+anything where you need to see and react to output as it happens rather
+than type a whole line first (`ttyt`'s normal input model buffers what you
+type until Enter, which doesn't match a raw terminal's turn-by-turn
+echo).
+
+While active, the input line is replaced by a bare `-- RAW --` state
+label — there's no buffered text to show, since nothing is buffered.
+`Ctrl+T` again exits back to the normal input line.
+
+Passthrough is total: **every other key, including `Ctrl+C`, `Ctrl+N`,
+`Ctrl+P`, and `Ctrl+R`, is sent to the device instead of triggering ttyt's
+own shortcut** — network device CLIs commonly bind several of these
+themselves (Ctrl+C to abort a running command, Ctrl+N/Ctrl+P to step
+through command history), and intercepting them would defeat the point of
+a raw passthrough mode. `Ctrl+T` is the only reserved key while it's
+active; it's also the only way out, so if you switch to raw mode you can't
+disconnect or switch tabs until you toggle back out of it first. Arrow
+keys send their real ANSI escape sequence (`\x1b[A` etc.) so device-side
+command-history navigation works the same as it would in a real terminal;
+Enter sends `\r`, matching a real terminal rather than `\n`.
 
 ### Session replay
 

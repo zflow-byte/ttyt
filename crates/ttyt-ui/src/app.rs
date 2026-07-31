@@ -156,10 +156,17 @@ pub struct Session {
     pub hint: Option<String>,
     pub disconnect_requested: bool,
     pending_submit: Option<String>,
-    /// Set by `on_key_in_pagination` when a keystroke should go straight
-    /// to the device as a single raw byte instead of through the normal
-    /// `input`/`pending_submit` line-submission path.
-    pending_raw_key: Option<u8>,
+    /// Set by `on_key_in_pagination` (one byte) or `on_key_in_raw`
+    /// (possibly several, e.g. an arrow key's ANSI escape sequence) when a
+    /// keystroke should go straight to the device instead of through the
+    /// normal `input`/`pending_submit` line-submission path.
+    pending_raw_bytes: Option<Vec<u8>>,
+    /// True while raw passthrough mode (Ctrl+T) is active: every keystroke
+    /// except the Ctrl+T toggle itself is converted straight to bytes and
+    /// sent to the device, bypassing `input`/`Mode` entirely -- see
+    /// `App::on_key`'s doc comment for why this is a separate flag rather
+    /// than another `Mode` variant.
+    pub(crate) raw_mode_active: bool,
     /// A line still being received (no trailing newline yet), from the
     /// most recent `SessionEvent::PartialLine`. Rendered as a live preview
     /// below `scrollback` so output appears as it streams in rather than
@@ -190,7 +197,8 @@ impl Session {
             hint: None,
             disconnect_requested: false,
             pending_submit: None,
-            pending_raw_key: None,
+            pending_raw_bytes: None,
+            raw_mode_active: false,
             partial_output: None,
         }
     }
@@ -238,6 +246,14 @@ impl Session {
                     // in place would look like a live line on a dead
                     // connection.
                     self.partial_output = None;
+                    // Same reasoning extends to raw mode: with the
+                    // connection gone, every further keystroke would
+                    // queue bytes for a `write_raw` that can only fail,
+                    // while the input line keeps showing "-- RAW --" as
+                    // if the session were still live -- exactly the
+                    // "can't tell what state I'm in" complaint this mode
+                    // was built to fix, now reintroduced on disconnect.
+                    self.raw_mode_active = false;
                 }
                 self.connection_state = state;
             }
@@ -286,9 +302,10 @@ impl Session {
         self.pending_submit.take()
     }
 
-    /// Takes the single raw byte queued by `on_key_in_pagination`, if any.
-    pub fn take_pending_raw_key(&mut self) -> Option<u8> {
-        self.pending_raw_key.take()
+    /// Takes the raw bytes queued by `on_key_in_pagination`/`on_key_in_raw`,
+    /// if any.
+    pub fn take_pending_raw_bytes(&mut self) -> Option<Vec<u8>> {
+        self.pending_raw_bytes.take()
     }
 
     /// ESC's behavior in `Mode::Normal` (the other modes handle their own
@@ -410,7 +427,62 @@ impl Session {
             KeyCode::Char(c) if c.is_ascii() => Some(c as u8),
             _ => None,
         };
-        self.pending_raw_key = byte;
+        self.pending_raw_bytes = byte.map(|b| vec![b]);
+    }
+
+    /// Toggles raw passthrough mode on or off (Ctrl+T, checked by
+    /// `App::on_key` before any other dispatch). Turning it off resets
+    /// `mode` to `Normal` -- an event that arrived while raw mode was
+    /// active (e.g. a `PaginationPrompt`, which still sets `self.mode =
+    /// Mode::Pagination` in `apply()` for its scrollback side effect even
+    /// though nothing was reading `mode` at the time) must not surface as
+    /// a stale overlay the moment normal key dispatch resumes.
+    pub(crate) fn toggle_raw_mode(&mut self) {
+        self.raw_mode_active = !self.raw_mode_active;
+        if !self.raw_mode_active {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Key handling while raw passthrough mode is active: every key
+    /// converts straight to the bytes a real terminal would send for it,
+    /// queued the same way `on_key_in_pagination` queues one -- but unlike
+    /// pagination, this does *not* exit after a single keystroke; only
+    /// `toggle_raw_mode` (Ctrl+T) turns it off. `Enter` sends `\r` (0x0D),
+    /// same reasoning as pagination: that's what a real terminal sends,
+    /// not `write_line`'s `\n`. Arrow keys send their full ANSI escape
+    /// sequence (`\x1b[A` etc.) since many device CLIs use them for
+    /// command-history navigation, same as a real serial terminal.
+    /// Uncovered keys (function keys, Home/End, ...) are silently dropped,
+    /// same as pagination's fallback -- there's no verified byte sequence
+    /// to send without real hardware to test against.
+    ///
+    /// Ctrl+letter is translated to its real control byte (Ctrl+A = 0x01
+    /// ... Ctrl+Z = 0x1A) rather than the plain letter -- crossterm
+    /// reports Ctrl+C as `Char('c')` with the CONTROL modifier set, not as
+    /// a distinct keycode, so without this check every Ctrl+letter combo
+    /// (Ctrl+C, Ctrl+N, Ctrl+P, Ctrl+R -- all deliberately passed through
+    /// to the device by raw mode, see `App::on_key`) would send the wrong
+    /// byte entirely.
+    fn on_key_in_raw(&mut self, key: KeyEvent) {
+        let bytes: Option<Vec<u8>> = match key.code {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() =>
+            {
+                Some(vec![(c.to_ascii_uppercase() as u8) - b'A' + 1])
+            }
+            KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+            KeyCode::Enter => Some(vec![b'\r']),
+            KeyCode::Backspace => Some(vec![0x7f]),
+            KeyCode::Tab => Some(vec![b'\t']),
+            KeyCode::Esc => Some(vec![0x1b]),
+            KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
+            KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
+            KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
+            KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
+            _ => None,
+        };
+        self.pending_raw_bytes = bytes;
     }
 
     /// TAB: completes `input` from `suggestions`, inserting into the
@@ -628,11 +700,22 @@ impl Session {
         matches!(self.mode, Mode::Pagination)
     }
 
+    pub(crate) fn is_raw_mode_active(&self) -> bool {
+        self.raw_mode_active
+    }
+
     /// What the console pane's input line should display: the normal
     /// `> {input}` prompt, a bash-style `(reverse-i-search)` line while
-    /// history search is active, or a y/N confirmation prompt while a
-    /// dangerous command awaits confirmation.
+    /// history search is active, a y/N confirmation prompt while a
+    /// dangerous command awaits confirmation, or a bare state label while
+    /// raw passthrough mode is active -- checked before `mode` since raw
+    /// mode is a separate flag, not a `Mode` variant (see `App::on_key`).
+    /// No accumulated input is shown in raw mode: every keystroke already
+    /// went straight to the device, there's nothing buffered to display.
     pub fn input_line_display(&self) -> String {
+        if self.raw_mode_active {
+            return "-- RAW -- (Ctrl+T to exit)".to_string();
+        }
         match &self.mode {
             Mode::HistorySearch(search) => {
                 let matched = self.current_history_match(search).unwrap_or("");
@@ -772,7 +855,26 @@ impl App {
     /// Ctrl+C had to be checked before history search's own key dispatch
     /// in Phase 2 -- routing it through a mode's handler risks the mode
     /// swallowing it as ordinary input instead.
+    ///
+    /// Raw passthrough mode (Ctrl+T) inverts this: it's genuine `screen`-
+    /// like passthrough, so *nothing* except the toggle itself may be
+    /// intercepted -- Ctrl+C, Ctrl+N, Ctrl+P, Ctrl+R all need to reach the
+    /// device as raw bytes (network device CLIs commonly bind several of
+    /// these themselves, e.g. Ctrl+C to abort a running command, Ctrl+N/
+    /// Ctrl+P to step through command history). That means the toggle has
+    /// to be checked, and raw mode dispatched, *before* the global Ctrl+C/
+    /// Ctrl+N checks below and before `Session::on_key` (which owns its
+    /// own Ctrl+R/Ctrl+P checks) -- otherwise those keys would never make
+    /// it to `on_key_in_raw` at all.
     pub fn on_key(&mut self, key: KeyEvent) {
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('t') {
+            self.active_session_mut().toggle_raw_mode();
+            return;
+        }
+        if self.active_session().is_raw_mode_active() {
+            self.active_session_mut().on_key_in_raw(key);
+            return;
+        }
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('n') {
             self.cycle_active_session();
             return;
@@ -830,11 +932,12 @@ pub fn spawn_input_thread(poll_interval: Duration) -> mpsc::UnboundedReceiver<Ke
 /// inbound nor outbound channel is acted on inside this crate -- that
 /// keeps `ttyt-ui` decoupled from `ttyt-core`'s connection/serial types;
 /// the caller owns every session's `ConnectionHandle` and reacts to both.
-/// `raw_key_tx` is the same idea for a single passthrough byte queued by
-/// `Mode::Pagination` (see `Session::take_pending_raw_key`) -- kept as its
-/// own channel rather than folded into `submit_tx`'s `String` payload so
-/// neither call site has to distinguish "a submitted line" from "one raw
-/// byte" inside a shared payload type. `theme` is likewise the caller's
+/// `raw_key_tx` is the same idea for the passthrough bytes queued by
+/// `Mode::Pagination` or raw passthrough mode (see `Session::
+/// take_pending_raw_bytes`) -- kept as its own channel rather than folded
+/// into `submit_tx`'s `String` payload so neither call site has to
+/// distinguish "a submitted line" from "raw bytes" inside a shared payload
+/// type. `theme` is likewise the caller's
 /// choice (`Theme::from_name(&config.theme)`) rather than hardcoded here,
 /// for the same "no `ttyt-core` dependency" reason -- this crate resolves
 /// a theme *name* to a palette, but never reads `Config` itself.
@@ -844,7 +947,7 @@ pub async fn run<B: Backend>(
     session_events: &mut mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
     submit_tx: mpsc::UnboundedSender<(SessionId, String)>,
     disconnect_tx: mpsc::UnboundedSender<SessionId>,
-    raw_key_tx: mpsc::UnboundedSender<(SessionId, u8)>,
+    raw_key_tx: mpsc::UnboundedSender<(SessionId, Vec<u8>)>,
     theme: Theme,
 ) -> std::io::Result<()> {
     let mut key_events = spawn_input_thread(Duration::from_millis(100));
@@ -884,7 +987,7 @@ fn handle_key_event(
     key: KeyEvent,
     submit_tx: &mpsc::UnboundedSender<(SessionId, String)>,
     disconnect_tx: &mpsc::UnboundedSender<SessionId>,
-    raw_key_tx: &mpsc::UnboundedSender<(SessionId, u8)>,
+    raw_key_tx: &mpsc::UnboundedSender<(SessionId, Vec<u8>)>,
 ) -> bool {
     app.on_key(key);
     let session = app.active_session_mut();
@@ -893,8 +996,8 @@ fn handle_key_event(
         session.push_history(line.clone());
         let _ = submit_tx.send((id, line));
     }
-    if let Some(byte) = session.take_pending_raw_key() {
-        let _ = raw_key_tx.send((id, byte));
+    if let Some(bytes) = session.take_pending_raw_bytes() {
+        let _ = raw_key_tx.send((id, bytes));
     }
     if session.disconnect_requested {
         session.disconnect_requested = false;
@@ -1087,7 +1190,10 @@ mod tests {
             SessionEvent::PaginationPrompt("--More--".to_string()),
         );
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char(' ')));
-        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b' '));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![b' '])
+        );
         assert!(!app.active_session().is_pagination_active());
     }
 
@@ -1102,7 +1208,10 @@ mod tests {
             SessionEvent::PaginationPrompt("--More--".to_string()),
         );
         app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
-        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b'\r'));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![b'\r'])
+        );
     }
 
     #[test]
@@ -1113,7 +1222,10 @@ mod tests {
             SessionEvent::PaginationPrompt("--More--".to_string()),
         );
         app.on_key(key(KeyModifiers::NONE, KeyCode::Char('q')));
-        assert_eq!(app.active_session_mut().take_pending_raw_key(), Some(b'q'));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![b'q'])
+        );
     }
 
     #[test]
@@ -1127,7 +1239,7 @@ mod tests {
             SessionEvent::PaginationPrompt("--More--".to_string()),
         );
         app.on_key(key(KeyModifiers::NONE, KeyCode::Esc));
-        assert_eq!(app.active_session_mut().take_pending_raw_key(), None);
+        assert_eq!(app.active_session_mut().take_pending_raw_bytes(), None);
         assert!(!app.active_session().is_pagination_active());
     }
 
@@ -1161,6 +1273,191 @@ mod tests {
                 .input_line_display()
                 .starts_with("-- More --")
         );
+    }
+
+    #[test]
+    fn ctrl_t_toggles_raw_mode_on_and_off() {
+        let mut app = App::new();
+        assert!(!app.active_session().is_raw_mode_active());
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert!(app.active_session().is_raw_mode_active());
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert!(!app.active_session().is_raw_mode_active());
+    }
+
+    #[test]
+    fn raw_mode_does_not_exit_after_a_single_keystroke() {
+        // Unlike Mode::Pagination, raw mode must stay active across many
+        // keystrokes -- only the Ctrl+T toggle turns it off.
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('a')));
+        assert!(app.active_session().is_raw_mode_active());
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+        assert!(app.active_session().is_raw_mode_active());
+    }
+
+    #[test]
+    fn typed_char_in_raw_mode_queues_its_byte_and_does_not_touch_input() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('a')));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![b'a'])
+        );
+        assert_eq!(
+            app.active_session().input,
+            "",
+            "raw mode must never buffer into the normal input line"
+        );
+    }
+
+    #[test]
+    fn enter_in_raw_mode_queues_carriage_return_not_linefeed() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Enter));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![b'\r'])
+        );
+    }
+
+    #[test]
+    fn backspace_in_raw_mode_queues_del_byte() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Backspace));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![0x7f])
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_raw_mode_queue_their_full_ansi_escape_sequence() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Up));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![0x1b, b'[', b'A'])
+        );
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Down));
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![0x1b, b'[', b'B'])
+        );
+    }
+
+    #[test]
+    fn ctrl_c_in_raw_mode_passes_through_to_the_device_instead_of_disconnecting() {
+        // The whole point of raw mode is genuine `screen`-like passthrough
+        // -- a device CLI commonly binds Ctrl+C itself (abort a running
+        // command), so it must reach the device as byte 0x03, not be
+        // intercepted as ttyt's own disconnect shortcut.
+        let mut app = App::new();
+        app.active_session_mut().connection_state = ConnectionState::Connected;
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('c')));
+        assert!(!app.active_session().disconnect_requested);
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![0x03])
+        );
+        assert!(app.active_session().is_raw_mode_active());
+    }
+
+    #[test]
+    fn ctrl_n_in_raw_mode_passes_through_instead_of_switching_tabs() {
+        let mut app = App::with_session_count(2);
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('n')));
+        assert_eq!(app.active, 0, "Ctrl+N must not switch tabs in raw mode");
+        assert_eq!(
+            app.active_session_mut().take_pending_raw_bytes(),
+            Some(vec![0x0e])
+        );
+    }
+
+    #[test]
+    fn ctrl_t_queues_no_bytes_and_is_never_sent_to_the_device() {
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert_eq!(app.active_session_mut().take_pending_raw_bytes(), None);
+    }
+
+    #[test]
+    fn input_line_display_shows_only_the_raw_state_label_while_active() {
+        let mut app = App::new();
+        app.active_session_mut().input = "not sent".to_string();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert_eq!(
+            app.active_session().input_line_display(),
+            "-- RAW -- (Ctrl+T to exit)"
+        );
+    }
+
+    #[test]
+    fn exiting_raw_mode_resets_a_stale_mode_left_over_from_a_pagination_prompt() {
+        // A PaginationPrompt arriving while raw mode is active still sets
+        // `mode = Mode::Pagination` in apply() for its scrollback side
+        // effect, even though on_key_in_raw (not Session::on_key) is what
+        // handles every keystroke at the time. Exiting raw mode must not
+        // leave that stale mode behind to swallow the next keystroke as a
+        // pagination byte.
+        let mut app = App::new();
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PaginationPrompt("--More--".to_string()),
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t'))); // exit raw mode
+        assert!(!app.active_session().is_raw_mode_active());
+        assert!(!app.active_session().is_pagination_active());
+
+        app.on_key(key(KeyModifiers::NONE, KeyCode::Char('x')));
+        assert_eq!(app.active_session().input, "x");
+    }
+
+    #[test]
+    fn raw_mode_is_per_session_not_a_global_flag() {
+        // raw_mode_active lives on Session, one per tab -- toggling it on
+        // tab 1 must not leak onto tab 0 when the focus switches back.
+        let mut app = App::with_session_count(2);
+        app.active = 1;
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert!(app.active_session().is_raw_mode_active());
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t'))); // exit tab 1's raw mode
+        assert!(!app.active_session().is_raw_mode_active());
+
+        app.active = 0;
+        assert!(
+            !app.active_session().is_raw_mode_active(),
+            "tab 0 must never have entered raw mode just because tab 1 did"
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert!(app.active_session().is_raw_mode_active());
+    }
+
+    #[test]
+    fn disconnect_while_in_raw_mode_exits_raw_mode() {
+        // Otherwise the input line keeps showing "-- RAW --" and every
+        // keystroke keeps queuing bytes for a write_raw that can only
+        // fail, on a session that's already gone -- the same "can't tell
+        // what state I'm in" complaint raw mode exists to fix.
+        let mut app = App::new();
+        app.active_session_mut().connection_state = ConnectionState::Connected;
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
+        assert!(app.active_session().is_raw_mode_active());
+
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Disconnected),
+        );
+
+        assert!(!app.active_session().is_raw_mode_active());
     }
 
     #[test]
