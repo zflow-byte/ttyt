@@ -204,6 +204,11 @@ impl Session {
 
     pub fn clear_console(&mut self) {
         self.scrollback.clear();
+        // A live preview isn't part of `scrollback`, but "clear the
+        // console" should still mean the pane goes fully blank -- leaving
+        // a stuck partial line behind after Ctrl+L would look like the
+        // clear silently failed.
+        self.partial_output = None;
     }
 
     /// Records one submitted command in the in-memory history, bounded to
@@ -998,6 +1003,25 @@ mod tests {
             .push_line("some output".to_string());
         app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('l')));
         assert!(app.active_session().scrollback.is_empty());
+    }
+
+    #[test]
+    fn ctrl_l_also_clears_a_stuck_partial_preview() {
+        // Regression test: `partial_output` isn't part of `scrollback`,
+        // so clearing only that would leave a live preview visibly stuck
+        // on screen after Ctrl+L -- "clear the console" should mean the
+        // whole pane goes blank, not just the scrolled-back lines.
+        let mut app = App::new();
+        app.apply_session_event(
+            SessionId::new(0),
+            SessionEvent::PartialLine("Current".to_string()),
+        );
+        assert_eq!(
+            app.active_session().partial_output.as_deref(),
+            Some("Current")
+        );
+        app.on_key(key(KeyModifiers::CONTROL, KeyCode::Char('l')));
+        assert_eq!(app.active_session().partial_output, None);
     }
 
     #[test]

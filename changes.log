@@ -664,3 +664,34 @@ proving a 100+-character partial line's tail (not its stale head)
 actually renders on screen. Bumped workspace version 0.1.3 -> 0.1.4,
 tagged and pushed `v0.1.4`; Formula/ttyt.rb's `url`/`sha256` updated to
 point at the real v0.1.4 tarball in both this repo and the published tap.
+
+**Ctrl+L didn't clear a stuck partial preview, v0.1.5.** User reported
+real hardware testing against a FortiGate: the word "Current" appearing
+repeated down the sidebar area, and Ctrl+L not making it go away. The
+recorded session log did not contain "Current" anywhere, confirming
+whatever was on screen was not real device content flowing through
+`SessionEvent` (the recorder sees every `RawLine`/`PaginationPrompt`,
+never anything rendering-only) -- so the repeated-per-row visual itself
+was very likely a terminal-scrollback/copy artifact from how the
+screen text was captured (ttyt redraws in place via cursor movement,
+not new lines, so scrolling back through a terminal's own history and
+selecting text can interleave content from several different redraw
+frames), not something `ttyt` itself drew that way. That part was not
+reproduced and remains unconfirmed.
+
+What *was* confirmed by reading the code directly: `Session::
+clear_console` (bound to `Ctrl+L`) only ever cleared `scrollback` --
+`partial_output` (the live realtime-preview field added in v0.1.3) was
+never touched by it. A `--More--`-heavy session streaming lots of
+partial content could plausibly leave a stale preview on screen that
+`Ctrl+L` would not remove, exactly matching "clear ยังค้างอยู่." Fixed by
+clearing `partial_output` alongside `scrollback` in `clear_console`.
+Verified as a genuine fix the same way as prior UI regressions this
+project has shipped: reverted the one-line change, confirmed the new
+test failed with the exact predicted symptom, restored it, confirmed it
+passed.
+
+Full fmt/clippy -D warnings/test clean: 246 tests (162 core + 81 ui + 3
+cli), up from 245 in v0.1.4. Bumped workspace version 0.1.4 -> 0.1.5,
+tagged and pushed `v0.1.5`; Formula/ttyt.rb's `url`/`sha256` updated to
+point at the real v0.1.5 tarball in both this repo and the published tap.
