@@ -7,6 +7,43 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::App;
 use crate::theme::Theme;
 
+/// Prepares a live partial-line preview for display: unlike a finished
+/// scrollback line (read once, doesn't change), a partial line keeps
+/// growing, and what's new is always at the end -- so this shows the
+/// *tail*, not the head, once it's too long for the pane's width.
+/// `Paragraph` without `.wrap()` renders from the start of the string and
+/// clips at the area edge, so an unbounded-length line (Cisco `copy`
+/// progress marks, any command with no newline until it finishes) would
+/// otherwise render its first ~`width` characters once and then appear
+/// frozen while the device keeps working -- indistinguishable from an
+/// actual hang, the exact symptom this feature exists to rule out.
+///
+/// Also collapses a `\r`-based progress display (percentage counters that
+/// overwrite the same terminal column rather than appending, e.g.
+/// `10%\r20%\r30%`) to only the segment after the last `\r`: `Line`
+/// doesn't interpret control characters as cursor movement, so without
+/// this the raw text would render as the stages mashed together
+/// (`10%20%30%`) instead of the current value. `LineAssembler`'s own line
+/// contract is untouched -- this only affects what's shown for the
+/// still-growing preview, not what an eventually-completed line records
+/// to the log or feeds to the redactor.
+fn partial_line_preview(partial: &str, width: u16) -> &str {
+    let after_last_cr = match partial.rfind('\r') {
+        Some(idx) => &partial[idx + 1..],
+        None => partial,
+    };
+    let width = width as usize;
+    let char_count = after_last_cr.chars().count();
+    if char_count <= width {
+        return after_last_cr;
+    }
+    let skip = char_count - width;
+    match after_last_cr.char_indices().nth(skip) {
+        Some((byte_idx, _)) => &after_last_cr[byte_idx..],
+        None => after_last_cr,
+    }
+}
+
 /// Renders the scrollback (most recent lines that fit), an in-progress
 /// partial line if one is being previewed, and the live input line, and
 /// returns where the terminal cursor should sit so the caller can call
@@ -44,7 +81,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Positi
         .collect();
 
     if let Some(partial) = &session.partial_output {
-        lines.push(Line::from(partial.as_str()));
+        lines.push(Line::from(partial_line_preview(partial, inner.width)));
     }
 
     let prompt = session.input_line_display();
@@ -200,6 +237,82 @@ mod tests {
         assert!(
             partial_row.contains("Router#show ru"),
             "the partial line should render immediately above the input line, got {partial_row:?}"
+        );
+    }
+
+    #[test]
+    fn partial_line_preview_returns_short_text_unchanged() {
+        assert_eq!(partial_line_preview("Router#show ru", 40), "Router#show ru");
+    }
+
+    #[test]
+    fn partial_line_preview_shows_the_tail_not_the_head_when_too_long() {
+        // A `copy`/firmware-transfer progress line grows unbounded with no
+        // newline until it finishes -- showing the head would render once
+        // and then look frozen while the device keeps working, even
+        // though new characters keep arriving off the visible edge.
+        let long = "!".repeat(50) + "END";
+        let preview = partial_line_preview(&long, 10);
+        assert_eq!(preview, "!!!!!!!END");
+        assert_eq!(preview.chars().count(), 10);
+    }
+
+    #[test]
+    fn partial_line_preview_collapses_to_the_segment_after_the_last_carriage_return() {
+        // A `\r`-based progress counter overwrites the same terminal
+        // column rather than appending -- `Line` doesn't interpret `\r`
+        // as cursor movement, so without collapsing this the stages would
+        // render mashed together ("10%20%30%") instead of the current
+        // value ("30%").
+        assert_eq!(partial_line_preview("10%\r20%\r30%", 40), "30%");
+    }
+
+    #[test]
+    fn partial_line_preview_applies_width_truncation_after_cr_collapse() {
+        // "abcdefghij" is the segment after the last `\r`; width-5
+        // truncation should then take its tail, "fghij" -- proving the
+        // two rules compose (collapse first, then truncate what's left),
+        // not just that each works in isolation.
+        assert_eq!(partial_line_preview("old\rabcdefghij", 5), "fghij");
+    }
+
+    /// End-to-end proof (not just the pure-function unit tests above) that
+    /// a long partial line renders its tail on screen, using the same
+    /// `TestBackend` methodology as the other console regression tests.
+    #[test]
+    fn long_partial_line_renders_its_tail_in_the_pane() {
+        let width = 40u16;
+        let height = 10u16;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut app = App::new();
+        let long = "!".repeat(100) + "DONE";
+        app.active_session_mut().partial_output = Some(long);
+        let theme = Theme::dark();
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, area, &app, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Inner width is 38 (bordered pane); partial renders one row
+        // above the input line, i.e. y=7.
+        let partial_row = row_text(buffer, 7, width);
+        assert!(
+            partial_row.contains("DONE"),
+            "the partial line's tail (most recent content) should be visible, got {partial_row:?}"
+        );
+        assert!(
+            !partial_row.contains("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"),
+            "the partial line should not still be showing its stale head, got {partial_row:?}"
         );
     }
 }
