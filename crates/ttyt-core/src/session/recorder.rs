@@ -139,6 +139,18 @@ pub async fn run(
                 // candidates for the *current* prompt, not device output
                 // -- there is nothing to transcribe.)
             }
+            Ok(SessionEvent::PartialLine(_)) => {
+                // Deliberately never recorded, unlike PaginationPrompt
+                // above: a redaction pattern like `\bpassword\b` matches
+                // whole keywords, so a fragment such as
+                // "username admin passw" (word not fully arrived yet)
+                // would pass the redactor unmatched even though the
+                // eventual complete line matches and gets `[REDACTED]` --
+                // recording the fragment separately would let a reader
+                // reconstruct the secret from unredacted pieces despite
+                // the finished line being safe. The complete `RawLine`
+                // this eventually becomes is what gets recorded.
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
@@ -228,17 +240,21 @@ mod tests {
 
     #[test]
     fn password_split_across_three_reads_is_still_redacted_at_line_boundary() {
-        // The recorder must only ever see complete lines from the line
-        // assembler -- never raw byte chunks -- otherwise a password
-        // split mid-keyword across reads would never match the pattern.
+        // The recorder must only ever redact/record the complete line,
+        // never the `Partial` previews `feed` also emits along the way
+        // (`run`'s `PartialLine` arm ignores those, see its comment) --
+        // otherwise a password split mid-keyword across reads could reach
+        // the log unredacted before the full keyword had arrived.
         let mut assembler = LineAssembler::new();
         assert_eq!(
             assembler.feed(b"username admin "),
-            Vec::<AssembledOutput>::new()
+            vec![AssembledOutput::Partial("username admin ".to_string())]
         );
         assert_eq!(
             assembler.feed(b"password Sup"),
-            Vec::<AssembledOutput>::new()
+            vec![AssembledOutput::Partial(
+                "username admin password Sup".to_string()
+            )]
         );
         let output = assembler.feed(b"erSecret1\r\n");
         assert_eq!(

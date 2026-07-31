@@ -546,3 +546,82 @@ false-positive tradeoff). Bumped workspace version 0.1.1 -> 0.1.2
 (Cargo.toml + Cargo.lock), tagged and pushed `v0.1.2`; Formula/ttyt.rb's
 `url`/`sha256` updated to point at the real v0.1.2 tarball in both this
 repo and the published tap (github.com/zflow-byte/homebrew-ttyt).
+
+**Realtime output streaming, v0.1.3.** User request: connect/configure
+sessions should show realtime raw output from the device, not just after
+each line completes. Until now `LineAssembler::feed` only ever emitted
+content once a `\n` arrived (or a pagination marker matched) -- a line
+still being received (mid-way through a slow `show tech-support`, or any
+prompt that never sends a trailing newline) sat invisibly in the internal
+buffer the whole time, the same category of gap the v0.1.2 `--More--`
+work fixed for pagination prompts specifically, now generalized.
+
+- `LineAssembler::feed` gained a third `AssembledOutput::Partial(String)`
+  variant: after draining complete lines and checking for a pagination
+  marker, if anything is still buffered with no newline yet, it's emitted
+  as a live preview of the buffer's current content so far. The next
+  `feed()` call either replaces it with a longer `Partial` (more bytes,
+  still no newline), finalizes it into a `Line` (newline arrived), or
+  turns it into a `PaginationPrompt` (marker matched) -- never both a
+  stale `Partial` and its resolution in the same output.
+- New `SessionEvent::PartialLine(String)`, published by `reader_loop`
+  alongside `RawLine`/`PaginationPrompt`. Two places explicitly ignore it,
+  both documented inline with the reasoning: `recorder::run` (a
+  redaction pattern like `\bpassword\b` matches whole keywords, so a
+  fragment like "username admin passw" would pass through unredacted in
+  the log even though the eventual complete line matches and gets
+  `[REDACTED]` -- only the finished `RawLine` is ever recorded) and
+  `detector::run` (classifying a half-arrived line risks a premature
+  `parse_prompt`/`parse_output` match that then has to be corrected once
+  the rest arrives -- flicker for no benefit).
+- New `ttyt-ui` `Session::partial_output: Option<String>`, set by
+  `PartialLine` and cleared by `RawLine` (superseded by the authoritative
+  line), `PaginationPrompt` (buffer was already drained), and
+  `ConnectionStateChanged` transitioning to `Disconnected`/`Reconnecting`
+  (nothing more is coming to complete it -- left in place it would look
+  like a live line on a dead connection).
+- `widgets/console.rs` renders the partial line between scrollback and
+  the input line. This surfaced a second, unrelated row-budget bug caught
+  before it shipped (advisor review flagged it): the pane only ever
+  reserved one row for the input line; with scrollback already filling
+  the pane, adding a partial line without reserving a second row handed
+  `Paragraph` one more line than the pane had rows, clipping the input
+  line off the bottom while the cursor (still calculated as the pane's
+  last row) pointed at nothing drawn there -- same failure shape as the
+  v0.1.1 top-alignment bug, different cause. Fixed by reserving two rows
+  instead of one whenever a partial line is present. Verified as a real
+  regression test (not just plausible-looking): reverted the two-row
+  reservation, confirmed the new test failed with exactly the predicted
+  symptom, restored it, confirmed it passed.
+
+Two existing real-PTY tests
+(`real_pty_bytes_flow_through_to_raw_line_events`,
+`real_pty_more_prompt_and_raw_key_response_round_trip`) were made robust
+against a real PTY splitting a write mid-marker/mid-line, which would
+now interleave a `PartialLine` where the tests asserted a bare event
+sequence -- a `recv_skipping_partial` test helper drains and skips
+`PartialLine`s before asserting the event under test (this was flagged
+by review before it caused an intermittent CI failure, not caught by
+one). A new dedicated real-PTY test,
+`real_pty_partial_line_streams_before_the_newline_arrives`, directly
+proves the live-streaming claim itself: two separate writes with no
+newline in between produce a `PartialLine` for the first write before
+the `RawLine` for the completed line arrives.
+
+Known tradeoff, noted rather than mitigated: this roughly doubles event-
+bus traffic in the worst case (up to one more event per `read()` call).
+`recorder::run` treats a lagged receiver as "log a warning, skip it,
+keep going" (`RecvError::Lagged`), so higher traffic in the same
+1024-slot bus makes a dropped log line marginally more likely under a
+very chatty device. Likely fine at real serial baud rates; flagged here
+so it's a known tradeoff if a transcript ever comes up short, not a
+surprise.
+
+Full fmt/clippy -D warnings/test clean: 240 tests (162 core + 75 ui + 3
+cli), up from 237 in v0.1.2. README gained a "Realtime output" section
+and the pagination false-negative bullet was softened to match the new
+reality (an unlisted marker variant's prompt text is now visible live,
+just without passthrough -- not invisible like before). Bumped workspace
+version 0.1.2 -> 0.1.3, tagged and pushed `v0.1.3`; Formula/ttyt.rb's
+`url`/`sha256` updated to point at the real v0.1.3 tarball in both this
+repo and the published tap.

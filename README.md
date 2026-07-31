@@ -126,6 +126,20 @@ Keybindings inside the console:
 search or the palette is active, so there's always a way out of a mode
 without getting stuck in it.
 
+### Realtime output
+
+The console renders device output as it streams in, not only once each
+line is terminated by a newline — a line still in progress (e.g. mid-way
+through a slow `show tech-support`, or waiting at a prompt that never
+sends a trailing newline at all) shows up live as a preview beneath
+scrollback, the same way a real terminal fills in a line character by
+character. Once the newline arrives, the preview is replaced by the
+finished line in scrollback — the two are never both shown. This preview
+is display-only: it's never written to the session log/command history
+(only the finished, redacted line is — see "Session recordings" below)
+and never fed to vendor detection/prompt parsing (which only classify
+complete lines, to avoid a premature match on half a line).
+
 ### Pagination (`--More--`) support
 
 Devices that page long output (`--More--` on Cisco/Dell OS10/Aruba CX,
@@ -194,19 +208,22 @@ value. Every history file is created `0600`.
   one of the other markers) ever appears as literal text inside ordinary,
   non-paginated output with no trailing newline yet, ttyt will switch to
   pagination mode on a false match. `Esc` cancels back to normal input
-  without sending anything if this happens. The other direction is worse
-  and easy to miss: the marker list (`--More--`, `---- More ----`,
-  `---(more`) was reconstructed from vendor documentation, not captured
-  from real hardware, same caveat as the Phase 2 vendor plugins below —
-  if a real device pages with a variant not in that list (older
-  ProCurve/AOS-Switch Aruba gear uses `-- MORE --, next page: Space, next
-  line: Enter, quit: Control-C`, different spacing/case than the AOS-CX
-  form above; escape-sequence decoration around the marker would also
-  break a plain substring match), that output stays invisible in the
-  buffer and the session looks hung with no explanation -- the exact
-  symptom this feature was built to fix, recurring for an unlisted
-  variant. If that happens, capture the raw bytes and add the variant to
-  `PAGINATION_MARKERS` in `crates/ttyt-core/src/events/line_assembler.rs`.
+  without sending anything if this happens. The other direction is milder
+  than it used to be, now that realtime output streaming (above) shows
+  unterminated content live either way: the marker list (`--More--`,
+  `---- More ----`, `---(more`) was reconstructed from vendor
+  documentation, not captured from real hardware, same caveat as the
+  Phase 2 vendor plugins below — if a real device pages with a variant
+  not in that list (older ProCurve/AOS-Switch Aruba gear uses
+  `-- MORE --, next page: Space, next line: Enter, quit: Control-C`,
+  different spacing/case than the AOS-CX form above; escape-sequence
+  decoration around the marker would also break a plain substring match),
+  the prompt text is still visible on screen as a live preview, but ttyt
+  won't recognize it as a pagination prompt: no passthrough mode, so
+  pressing a key types into the input line instead of paging, and the
+  session looks stuck until you realize why. If that happens, capture the
+  raw bytes and add the variant to `PAGINATION_MARKERS` in
+  `crates/ttyt-core/src/events/line_assembler.rs`.
 - Vendor detection scans up to 40 lines after connect looking for a known
   banner; if none of the plugins match in that window, vendor status
   becomes `Unknown` rather than continuing to scan indefinitely. Fortinet

@@ -64,6 +64,14 @@ pub enum SessionEvent {
     /// prompt text so it can still be shown in the console like any other
     /// output line.
     PaginationPrompt(String),
+    /// A live preview of a line still being received (no trailing newline
+    /// yet), so the console can render output as it streams in rather
+    /// than only after each line completes. Display-only: never recorded
+    /// to the session log/history the way `RawLine` is -- see
+    /// [`LineAssembler::feed`]'s doc comment for the redaction reasoning
+    /// -- and never fed to the detector, which only classifies complete
+    /// lines.
+    PartialLine(String),
 }
 
 /// A single-producer, multi-consumer fan-out for `SessionEvent`s. Every

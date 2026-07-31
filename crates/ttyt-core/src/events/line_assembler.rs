@@ -18,14 +18,19 @@ fn matches_pagination_marker(partial: &str) -> bool {
         .any(|marker| partial.contains(marker))
 }
 
-/// One unit of output assembled from the device's byte stream: either a
-/// complete, newline-terminated line, or a pagination prompt recognized
-/// from an unterminated buffer tail (these never end in a newline -- the
-/// device is blocked waiting for a single keystroke, not more text).
+/// One unit of output assembled from the device's byte stream: a complete,
+/// newline-terminated line; a pagination prompt recognized from an
+/// unterminated buffer tail (these never end in a newline -- the device is
+/// blocked waiting for a single keystroke, not more text); or a live
+/// preview of a line still in progress, so the console can render output
+/// as it streams in like a real terminal instead of only after each
+/// newline (see `feed`'s doc comment for why this is safe to show on
+/// screen but must never be recorded to the session log).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembledOutput {
     Line(String),
     PaginationPrompt(String),
+    Partial(String),
 }
 
 /// Turns a raw byte stream (arriving in arbitrarily-sized, arbitrarily-split
@@ -47,8 +52,19 @@ impl LineAssembler {
 
     /// Feed newly-read bytes in. Returns zero or more assembled outputs:
     /// complete lines from this call's bytes plus anything buffered from
-    /// earlier calls, and a pagination prompt if the remaining unterminated
-    /// buffer matches a known marker.
+    /// earlier calls; a pagination prompt if the remaining unterminated
+    /// buffer matches a known marker; otherwise, if anything is still
+    /// buffered with no newline yet, a `Partial` carrying the buffer's
+    /// current content so far.
+    ///
+    /// `Partial` is meant for on-screen display only -- callers must never
+    /// write it to the session log/history the way a `Line` is. A
+    /// redaction pattern like `\bpassword\b` matches whole keywords, so a
+    /// fragment like `username admin passw` (word not fully arrived yet)
+    /// would pass through unredacted even though the eventual complete
+    /// line matches and gets `[REDACTED]` -- recording the fragment
+    /// separately would let a reader reconstruct the secret from
+    /// unredacted pieces despite the finished line being safe.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<AssembledOutput> {
         self.buffer.extend_from_slice(bytes);
 
@@ -74,6 +90,8 @@ impl LineAssembler {
                 let prompt = partial.into_owned();
                 self.buffer.clear();
                 output.push(AssembledOutput::PaginationPrompt(prompt));
+            } else {
+                output.push(AssembledOutput::Partial(partial.into_owned()));
             }
         }
 
@@ -103,9 +121,7 @@ mod tests {
             .into_iter()
             .map(|item| match item {
                 AssembledOutput::Line(s) => s,
-                AssembledOutput::PaginationPrompt(s) => {
-                    panic!("expected only lines, got a pagination prompt: {s:?}")
-                }
+                other => panic!("expected only lines, got {other:?}"),
             })
             .collect()
     }
@@ -113,11 +129,35 @@ mod tests {
     #[test]
     fn line_split_across_multiple_reads_assembles_correctly() {
         let mut assembler = LineAssembler::new();
-        assert_eq!(assembler.feed(b"Switch"), Vec::<AssembledOutput>::new());
-        assert_eq!(assembler.feed(b"> "), Vec::<AssembledOutput>::new());
+        assert_eq!(
+            assembler.feed(b"Switch"),
+            vec![AssembledOutput::Partial("Switch".to_string())]
+        );
+        assert_eq!(
+            assembler.feed(b"> "),
+            vec![AssembledOutput::Partial("Switch> ".to_string())]
+        );
         assert_eq!(
             lines_only(assembler.feed(b"\r\n")),
             vec!["Switch> ".to_string()]
+        );
+    }
+
+    #[test]
+    fn partial_is_emitted_live_and_replaced_by_the_line_once_terminated() {
+        // The console renders `Partial` as a growing preview, then
+        // discards it in favor of the authoritative `Line` once the
+        // newline arrives -- this is what makes that safe: the feed()
+        // call that completes the line does NOT also emit a stale
+        // Partial for the same content.
+        let mut assembler = LineAssembler::new();
+        assert_eq!(
+            assembler.feed(b"show run"),
+            vec![AssembledOutput::Partial("show run".to_string())]
+        );
+        assert_eq!(
+            assembler.feed(b"ning-config\n"),
+            vec![AssembledOutput::Line("show running-config".to_string())]
         );
     }
 
@@ -149,7 +189,7 @@ mod tests {
         let mut assembler = LineAssembler::new();
         assert_eq!(
             assembler.feed(b"no newline yet"),
-            Vec::<AssembledOutput>::new()
+            vec![AssembledOutput::Partial("no newline yet".to_string())]
         );
         assert_eq!(assembler.flush(), Some("no newline yet".to_string()));
     }
@@ -182,7 +222,10 @@ mod tests {
     #[test]
     fn more_prompt_split_across_reads_is_still_recognized() {
         let mut assembler = LineAssembler::new();
-        assert_eq!(assembler.feed(b"--Mo"), Vec::<AssembledOutput>::new());
+        assert_eq!(
+            assembler.feed(b"--Mo"),
+            vec![AssembledOutput::Partial("--Mo".to_string())]
+        );
         let output = assembler.feed(b"re--");
         assert_eq!(
             output,
@@ -219,7 +262,7 @@ mod tests {
         let mut assembler = LineAssembler::new();
         assert_eq!(
             assembler.feed(b"Router#show run"),
-            Vec::<AssembledOutput>::new()
+            vec![AssembledOutput::Partial("Router#show run".to_string())]
         );
         assert_eq!(assembler.flush(), Some("Router#show run".to_string()));
     }

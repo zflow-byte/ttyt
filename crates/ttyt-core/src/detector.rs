@@ -123,6 +123,15 @@ pub async fn run(
                 // mode), and there's nothing here for prompt/vendor
                 // detection to do with it.
             }
+            Ok(SessionEvent::PartialLine(_)) => {
+                // Deliberately not classified: only the eventual complete
+                // `RawLine` is. Running `parse_prompt`/`parse_output`
+                // against a half-arrived line risks a premature match
+                // that then has to be corrected once the rest of the
+                // line arrives -- flicker for no benefit, since the
+                // complete classification is always seconds away at
+                // most.
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(skipped, "detector lagged, some lines were not classified");
             }

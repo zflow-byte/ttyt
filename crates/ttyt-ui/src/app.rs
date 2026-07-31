@@ -160,6 +160,14 @@ pub struct Session {
     /// to the device as a single raw byte instead of through the normal
     /// `input`/`pending_submit` line-submission path.
     pending_raw_key: Option<u8>,
+    /// A line still being received (no trailing newline yet), from the
+    /// most recent `SessionEvent::PartialLine`. Rendered as a live preview
+    /// below `scrollback` so output appears as it streams in rather than
+    /// only once each line completes -- cleared (not pushed to
+    /// `scrollback`) once the authoritative `RawLine`/`PaginationPrompt`
+    /// for the same content arrives, and on disconnect/reconnect so a
+    /// stale in-progress line doesn't linger looking still-live.
+    pub partial_output: Option<String>,
 }
 
 impl Session {
@@ -183,6 +191,7 @@ impl Session {
             disconnect_requested: false,
             pending_submit: None,
             pending_raw_key: None,
+            partial_output: None,
         }
     }
 
@@ -209,8 +218,24 @@ impl Session {
 
     fn apply(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::RawLine(line) => self.push_line(line),
-            SessionEvent::ConnectionStateChanged(state) => self.connection_state = state,
+            SessionEvent::RawLine(line) => {
+                // The authoritative complete line supersedes whatever
+                // preview was building toward it.
+                self.partial_output = None;
+                self.push_line(line);
+            }
+            SessionEvent::ConnectionStateChanged(state) => {
+                if matches!(
+                    state,
+                    ConnectionState::Disconnected | ConnectionState::Reconnecting
+                ) {
+                    // Nothing more is coming to complete it -- leaving it
+                    // in place would look like a live line on a dead
+                    // connection.
+                    self.partial_output = None;
+                }
+                self.connection_state = state;
+            }
             SessionEvent::VendorDetection(status) => self.vendor_status = Some(status),
             SessionEvent::PromptChanged(prompt) => self.prompt = Some(prompt),
             SessionEvent::Parsed(event) => {
@@ -229,6 +254,11 @@ impl Session {
                 self.tab_cycle = None;
             }
             SessionEvent::PaginationPrompt(prompt) => {
+                // The marker match that produced this drained the
+                // assembler's buffer, so no preview was building toward
+                // this same content -- cleared anyway for the same
+                // "nothing stale left showing" reasoning as RawLine.
+                self.partial_output = None;
                 // Shown in scrollback like any other output line, then
                 // the very next keystroke goes straight to the device
                 // instead of through the normal input line -- entering
@@ -236,6 +266,12 @@ impl Session {
                 // principle Ctrl+R/Ctrl+P already use.
                 self.push_line(prompt);
                 self.mode = Mode::Pagination;
+            }
+            SessionEvent::PartialLine(partial) => {
+                // Live preview only -- see `LineAssembler::feed`'s doc
+                // comment for why this must never be treated like a
+                // `RawLine` (pushed to `scrollback`, recorded, etc.).
+                self.partial_output = Some(partial);
             }
         }
     }

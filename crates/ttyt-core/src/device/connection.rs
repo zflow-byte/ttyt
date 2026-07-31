@@ -203,6 +203,9 @@ fn reader_loop<F>(
                         AssembledOutput::PaginationPrompt(prompt) => {
                             bus.publish(SessionEvent::PaginationPrompt(prompt));
                         }
+                        AssembledOutput::Partial(partial) => {
+                            bus.publish(SessionEvent::PartialLine(partial));
+                        }
                     }
                 }
             }
@@ -591,13 +594,87 @@ mod tests {
         std::io::Write::write_all(&mut controller, b"Switch> \r\n")
             .expect("write into the PTY controller side should succeed");
 
-        let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("timed out waiting for the real-PTY RawLine event")
-            .unwrap();
+        // A real PTY offers no guarantee this arrives as a single read --
+        // if it's split, a `PartialLine` preview could land before the
+        // `RawLine`; skip those, same reasoning as
+        // `real_pty_more_prompt_and_raw_key_response_round_trip`.
+        let event = recv_skipping_partial(&mut sub).await;
         assert_eq!(event, SessionEvent::RawLine("Switch> ".to_string()));
 
         handle.disconnect();
+    }
+
+    /// Direct proof of the realtime-output feature over a real PTY: two
+    /// separate writes with no newline in between must produce a
+    /// `PartialLine` for the first chunk before the `RawLine` for the
+    /// completed line arrives -- not just "the final line is correct" (the
+    /// mock-based `LineAssembler` tests already cover that), but "content
+    /// with no trailing newline yet actually reaches the bus live," which
+    /// only a genuine two-read split over real OS file descriptors proves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_pty_partial_line_streams_before_the_newline_arrives() {
+        let (mut controller, device_side) =
+            serialport::TTYPort::pair().expect("failed to allocate a PTY pair for this test");
+        let device_side: Box<dyn serialport::SerialPort> = Box::new(device_side);
+        let device_side: Box<dyn SerialTransport> = Box::new(device_side);
+
+        let bus = Arc::new(EventBus::new(16));
+        let mut sub = bus.subscribe();
+
+        let mut handle = ConnectionHandle::spawn(device_side, Arc::clone(&bus), || {
+            Err(CoreError::Config("no reopen in this test".to_string()))
+        });
+
+        assert_eq!(
+            sub.recv().await.unwrap(),
+            SessionEvent::ConnectionStateChanged(ConnectionState::Connected)
+        );
+
+        std::io::Write::write_all(&mut controller, b"Router#show ru")
+            .expect("first write into the PTY controller side should succeed");
+
+        let partial_event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for the real-PTY PartialLine event")
+            .unwrap();
+        assert_eq!(
+            partial_event,
+            SessionEvent::PartialLine("Router#show ru".to_string())
+        );
+
+        std::io::Write::write_all(&mut controller, b"nning-config\r\n")
+            .expect("second write into the PTY controller side should succeed");
+
+        let line_event = recv_skipping_partial(&mut sub).await;
+        assert_eq!(
+            line_event,
+            SessionEvent::RawLine("Router#show running-config".to_string())
+        );
+
+        handle.disconnect();
+    }
+
+    /// Receives the next event, transparently skipping any `PartialLine`s
+    /// along the way. A real PTY (unlike `MockTransport`'s single queued
+    /// read) offers no guarantee a given write arrives as one `read()` --
+    /// splitting it mid-marker would interleave a `PartialLine` before the
+    /// event under test, so asserting a bare `sub.recv()` sequence here
+    /// would be flaky. Live preview events are exactly what should be
+    /// skippable for a test like this one, which cares about the final
+    /// assembled result, not how many reads it took to get there.
+    async fn recv_skipping_partial(
+        sub: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> SessionEvent {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("timed out waiting for a non-partial event")
+                .unwrap();
+            if !matches!(event, SessionEvent::PartialLine(_)) {
+                return event;
+            }
+        }
     }
 
     /// End-to-end proof of the full `--More--` passthrough round trip over
@@ -635,19 +712,13 @@ mod tests {
         std::io::Write::write_all(&mut controller, b"interface Gi0/1\r\n--More--")
             .expect("write into the PTY controller side should succeed");
 
-        let line_event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("timed out waiting for the real-PTY RawLine event")
-            .unwrap();
+        let line_event = recv_skipping_partial(&mut sub).await;
         assert_eq!(
             line_event,
             SessionEvent::RawLine("interface Gi0/1".to_string())
         );
 
-        let prompt_event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("timed out waiting for the real-PTY PaginationPrompt event")
-            .unwrap();
+        let prompt_event = recv_skipping_partial(&mut sub).await;
         assert_eq!(
             prompt_event,
             SessionEvent::PaginationPrompt("--More--".to_string())
