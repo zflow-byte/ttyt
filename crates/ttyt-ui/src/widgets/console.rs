@@ -31,15 +31,71 @@ use crate::theme::Theme;
 /// out) -- this also handles a `\r`-based progress counter that
 /// overwrites the same column rather than appending, e.g. `10%\r20%\r30%`
 /// becomes `30%` instead of the stages rendering mashed together. Then
-/// strips any other control character (backspace, stray ANSI bytes, ...)
-/// that survives: these have no rendering meaning to `Line` either, and
-/// keeping them risks the same class of corruption `\r` caused.
+/// strips ANSI CSI escape sequences (see `strip_escape_sequences`) --
+/// found via a real device response to raw passthrough mode's `Backspace`
+/// (0x7F): an erase-in-line sequence (`\x1b[K`) came back, and while the
+/// bare `\x1b` control byte was already stripped by the final filter
+/// below, `[` and `K` are ordinary printable characters to that filter,
+/// so the literal text `[K` was left behind in the console -- exactly
+/// what was reported. Then strips any other remaining control character
+/// (a lone backspace, stray unterminated escape bytes, ...): these have
+/// no rendering meaning to `Line` either, and keeping them risks the same
+/// class of corruption `\r` caused (see v0.1.6).
 fn sanitize_for_display(text: &str) -> String {
     let after_last_cr = match text.rfind('\r') {
         Some(idx) => &text[idx + 1..],
         None => text,
     };
-    after_last_cr.chars().filter(|c| !c.is_control()).collect()
+    strip_escape_sequences(after_last_cr)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// Strips ANSI/VT100 escape sequences: `ESC` (0x1B) followed either by a
+/// CSI sequence (`[`, then any parameter bytes 0x20-0x3F, then one final
+/// byte 0x40-0x7E -- e.g. `\x1b[K` erase-in-line, `\x1b[1;32m` a color
+/// code) or, for any other byte after `ESC`, just that one byte (covers
+/// simple two-byte escape sequences). `Line` has no concept of these --
+/// it renders every character as literal cell content, never interprets
+/// a sequence as "erase" or "move cursor" -- so left unstripped, only the
+/// `ESC` byte itself (a control character) would be removed by
+/// `sanitize_for_display`'s final filter, leaving the rest of the
+/// sequence to show up as garbage literal text (e.g. `[K`).
+///
+/// This does not make erase/cursor-movement sequences actually erase or
+/// move anything in the rendered output -- `Line`/`Paragraph` still just
+/// concatenate whatever text remains, the same simplification the
+/// existing bare-backspace (`\x08`) handling already has (see
+/// `sanitize_for_display_strips_a_trailing_control_character`'s test).
+/// It only prevents the sequence's own bytes from appearing as visible
+/// garbage; real cursor-aware in-place editing within a growing line is
+/// a bigger feature this does not attempt.
+fn strip_escape_sequences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next(); // consume '['
+                while matches!(chars.peek(), Some(&p) if (' '..='?').contains(&p)) {
+                    chars.next();
+                }
+                if matches!(chars.peek(), Some(&p) if ('@'..='~').contains(&p)) {
+                    chars.next();
+                }
+            }
+            Some(_) => {
+                chars.next(); // consume the one byte after ESC
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// Prepares a live partial-line preview for display: unlike a finished
@@ -358,6 +414,28 @@ mod tests {
             sanitize_for_display("\r        \rvirtual domain: root"),
             "virtual domain: root"
         );
+    }
+
+    #[test]
+    fn sanitize_for_display_strips_an_erase_in_line_escape_sequence() {
+        // Regression test for a real device response to raw passthrough
+        // mode's Backspace: the device answered with `\x1b[K` (ANSI
+        // erase-in-line). The bare ESC byte was already a control
+        // character and got stripped, but `[` and `K` are ordinary
+        // printable characters -- without `strip_escape_sequences`,
+        // "user[K" would render with the literal garbage text "[K"
+        // visible, exactly as reported.
+        assert_eq!(sanitize_for_display("user\x1b[K"), "user");
+        assert_eq!(sanitize_for_display("user\x1b[Ks"), "users");
+    }
+
+    #[test]
+    fn sanitize_for_display_strips_a_color_escape_sequence() {
+        // A CSI sequence can carry any number of parameter bytes before
+        // its final byte, not just none -- e.g. an SGR color code like
+        // `\x1b[1;32m` (bold green). Proves the parameter-byte loop
+        // consumes the whole sequence, not just a single-parameter case.
+        assert_eq!(sanitize_for_display("\x1b[1;32mok\x1b[0m"), "ok");
     }
 
     /// End-to-end proof, not just the pure-function test above: a

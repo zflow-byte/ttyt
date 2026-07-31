@@ -860,3 +860,47 @@ Full fmt/clippy -D warnings/test clean: 265 tests (165 core + 97 ui + 3
 cli), up from 250 in v0.1.6. Bumped workspace version 0.1.6 -> 0.1.7,
 tagged and pushed `v0.1.7`; Formula/ttyt.rb's `url`/`sha256` updated to
 point at the real v0.1.7 tarball in both this repo and the published tap.
+
+**Escape-sequence garbage in the console pane, v0.1.8.** User reported
+real hardware testing of v0.1.7's raw passthrough mode: pressing
+Backspace/Delete didn't erase the typed character, and the literal text
+`[K` appeared on screen instead. Root cause: the device answered
+Backspace (raw mode sends `0x7F`) with an ANSI erase-in-line escape
+sequence, `\x1b[K`. `sanitize_for_display` (added in v0.1.6) already
+strips the bare `ESC` byte as a control character, but `[` and `K` are
+ordinary printable characters to that filter -- they survived and
+rendered as literal garbage text, exactly as reported. Same underlying
+class of bug as v0.1.6 (`Line` is not a terminal emulator and has no
+concept of an escape sequence, only literal cell content), just a
+different escape form: `\r` there, ANSI CSI here.
+
+Fixed with a new `strip_escape_sequences` helper in `widgets/console.rs`,
+called before the existing control-character filter: recognizes `ESC`
+followed by a CSI sequence (`[`, parameter/intermediate bytes 0x20-0x3F,
+one final byte 0x40-0x7E -- covers erase-in-line, cursor movement, SGR
+color codes, and more) and strips the whole sequence, or for any other
+byte after `ESC`, strips just that one byte (simple two-byte sequences).
+Shared by both scrollback and the live partial-line preview, same as
+every other `sanitize_for_display` fix. Explicitly documented as a
+partial fix, not a full one: this only removes the escape sequence's own
+bytes from the visible output -- it does not make erase-in-line or
+cursor-movement sequences actually erase or move anything, since
+`Line`/`Paragraph` still just concatenate whatever text remains with no
+real cursor-position tracking within a growing line (the same
+simplification the existing bare-backspace, `\x08`, handling already
+has, unremarked until now). Whether the device's Backspace now visually
+erases the character, not just stops showing `[K`, needs confirmation
+against real hardware -- if the character reappears after the erased
+position instead of actually disappearing, that's this limitation, not
+a regression, and would need real cursor-aware line editing to fix
+properly (a materially bigger feature, not attempted here).
+
+Verified via the usual revert-and-confirm-fail cycle: reverted the call
+to `strip_escape_sequences`, confirmed the two new tests failed with the
+exact predicted garbage (`"user[K"`, `"[1;32mok[0m"`), restored it,
+confirmed both passed.
+
+Full fmt/clippy -D warnings/test clean: 267 tests (165 core + 99 ui + 3
+cli), up from 265 in v0.1.7. Bumped workspace version 0.1.7 -> 0.1.8,
+tagged and pushed `v0.1.8`; Formula/ttyt.rb's `url`/`sha256` updated to
+point at the real v0.1.8 tarball in both this repo and the published tap.
