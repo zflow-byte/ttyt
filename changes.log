@@ -904,3 +904,80 @@ Full fmt/clippy -D warnings/test clean: 267 tests (165 core + 99 ui + 3
 cli), up from 265 in v0.1.7. Bumped workspace version 0.1.7 -> 0.1.8,
 tagged and pushed `v0.1.8`; Formula/ttyt.rb's `url`/`sha256` updated to
 point at the real v0.1.8 tarball in both this repo and the published tap.
+
+**Real cursor-aware line editing, v0.1.9.** User tested v0.1.8 on real
+hardware and reported raw passthrough mode still didn't feel like
+`screen`, specifically: "การแก้ไขบรรทัดขณะพิมพ์ยังแปลกๆ" (line editing
+while typing still looks off). Confirmed this was the same underlying
+gap the last two releases had been patching around, not a new bug:
+v0.1.6's `\r`-collapse and v0.1.8's CSI-stripping were both ad hoc rules
+that removed garbage bytes from the display but never gave `Line`/
+`Paragraph` any real concept of a cursor position within a line -- a
+device answering Backspace with `\x08` followed by `\x1b[K` (cursor
+left, then erase-to-end) would have the escape bytes cleanly stripped by
+v0.1.8, but the character it was erasing stayed on screen regardless,
+since nothing was tracking where "the cursor" actually was.
+
+Replaced both ad hoc rules with one general model:
+`widgets/console.rs`'s new `visible_text` (renamed from
+`sanitize_for_display`, which it subsumes) replays a raw string against
+a virtual cursor over a single line of cells, the same way a real
+terminal would for one line of input -- not a full 2D screen (no
+row/column cursor addressing, no scroll regions, deliberately out of
+scope), but line-local motions and erases: `\r` returns to column 0
+(`\r`-collapse falls out of this for free, no longer a special case),
+`\x08` moves the cursor left without erasing, `\x7f` (DEL) moves left
+*and* deletes that cell, `\x1b[K`/`\x1b[1K`/`\x1b[2K` erase in line,
+`\x1b[nD`/`\x1b[nC` move the cursor by `n`. Printable characters
+overwrite the cell at the cursor if one exists, otherwise append. Any
+other CSI final byte (SGR color, cursor positioning, screen clear, ...)
+is recognized and consumed so its bytes don't leak as literal garbage,
+but has no further effect -- correctly out of scope for a model that
+only tracks one line.
+
+Since the real device byte sequence behind the v0.1.8 report isn't
+known (no hardware access here to confirm), added a test for each of the
+three real-world Backspace-echo idioms most likely to be in play, so
+whichever one the actual device uses, there's already a named,
+passing test covering it: `\x08 \x08` (classic dumb-terminal erase: move
+left, overwrite with space, move left again), `\x08\x1b[K` /
+`\x1b[D\x1b[K` (cursor-left then erase-to-end, also handles erasing
+several characters at once via `user1234\x08\x08\x08\x08\x1b[K` ->
+`"user"`), and the `\r`-based full-line-redraw idiom the FortiGate
+`--More--` case already established. One existing test's expectation
+changed as a direct, intentional consequence: `"backspace\x08here"` used
+to assert `"backspacehere"` (the `\x08` byte stripped, nothing actually
+erased) -- now correctly asserts `"backspachere"` (cursor moves left one,
+`h` overwrites the trailing `e` of "backspace", `ere` appends after).
+
+Verified with the usual revert-and-confirm-fail cycle, this time against
+the specific line that gives `\x08` real cursor-move semantics rather
+than the whole feature at once: reverted just that one line to a no-op,
+confirmed 4 of the 7 new/changed tests failed with exactly the
+predicted stale (un-erased) output -- e.g. `"user1234"` instead of
+`"user"`, `"backspacehere"` instead of `"backspachere"` -- restored it,
+confirmed all 7 passed.
+
+**Not yet re-verified against the real hardware that reported this** --
+please confirm whether Backspace in raw mode now genuinely erases the
+character on screen (not just stops showing `[K`). If it still doesn't,
+that means the device's actual echo sequence isn't one of the three
+idioms tested here; capture the raw bytes if possible and it can be
+added as a fourth case.
+
+Ctrl+T ("การสลับเข้า/ออก (Ctrl+T) ใช้งานลำบาก" -- toggling in/out is
+awkward) was also flagged this same round but the specific complaint is
+still unclear -- deliberately not guessing a fix, since the two most
+likely causes (macOS/BSD terminal drivers reserve Ctrl+T as the
+`VSTATUS` character by default, which could swallow the keypress before
+it ever reaches `ttyt`; vs. the toggle-based interaction model itself
+being the friction, independent of which key triggers it) need
+completely different fixes and picking one without knowing which would
+be a guess, not a fix. Needs one more round of clarification: does
+Ctrl+T fail to register at all, or does it register but switching in
+and out of a distinct mode is itself the awkward part?
+
+Full fmt/clippy -D warnings/test clean: 270 tests (165 core + 102 ui + 3
+cli), up from 267 in v0.1.8. Bumped workspace version 0.1.8 -> 0.1.9,
+tagged and pushed `v0.1.9`; Formula/ttyt.rb's `url`/`sha256` updated to
+point at the real v0.1.9 tarball in both this repo and the published tap.

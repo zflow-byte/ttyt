@@ -7,110 +7,126 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::App;
 use crate::theme::Theme;
 
-/// Strips terminal control characters before a line is handed to ratatui
-/// for display. `Line`/`Span` render every character as literal, non-
-/// advancing cell content -- they are not a terminal emulator and don't
-/// interpret control bytes. crossterm then writes those cells verbatim to
-/// the real terminal, which *does* interpret them: a `\r` moves the
-/// cursor back to column 0, and everything ttyt draws afterward in the
-/// same paint overwrites earlier screen content instead of advancing past
-/// it. Confirmed against real FortiGate hardware: `--More--` paging
-/// erases its own prompt with a `\r`-erase-`\r` sequence before printing
-/// more text (`LineAssembler::feed`'s
-/// `embedded_carriage_returns_survive_into_the_emitted_line` test
-/// documents that this survives into the assembled line verbatim, by
-/// design -- the fix belongs here, not there). Left unsanitized, that one
-/// `\r` corrupted everything rendered after it for the rest of the paint:
-/// the Sessions pane's border vanished on the affected rows, and device
-/// text came out visibly overtyped mid-word ("Maxonumber" for "Max
-/// number", "vir ual" for "virtual" -- same length, characters
-/// overwritten in place, not dropped).
-///
-/// Collapses to the segment after the last `\r` (what a real terminal
-/// would show once every erase-and-redraw in the sequence has played
-/// out) -- this also handles a `\r`-based progress counter that
-/// overwrites the same column rather than appending, e.g. `10%\r20%\r30%`
-/// becomes `30%` instead of the stages rendering mashed together. Then
-/// strips ANSI CSI escape sequences (see `strip_escape_sequences`) --
-/// found via a real device response to raw passthrough mode's `Backspace`
-/// (0x7F): an erase-in-line sequence (`\x1b[K`) came back, and while the
-/// bare `\x1b` control byte was already stripped by the final filter
-/// below, `[` and `K` are ordinary printable characters to that filter,
-/// so the literal text `[K` was left behind in the console -- exactly
-/// what was reported. Then strips any other remaining control character
-/// (a lone backspace, stray unterminated escape bytes, ...): these have
-/// no rendering meaning to `Line` either, and keeping them risks the same
-/// class of corruption `\r` caused (see v0.1.6).
-fn sanitize_for_display(text: &str) -> String {
-    let after_last_cr = match text.rfind('\r') {
-        Some(idx) => &text[idx + 1..],
-        None => text,
-    };
-    strip_escape_sequences(after_last_cr)
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
-}
-
-/// Strips ANSI/VT100 escape sequences: `ESC` (0x1B) followed either by a
-/// CSI sequence (`[`, then any parameter bytes 0x20-0x3F, then one final
-/// byte 0x40-0x7E -- e.g. `\x1b[K` erase-in-line, `\x1b[1;32m` a color
-/// code) or, for any other byte after `ESC`, just that one byte (covers
-/// simple two-byte escape sequences). `Line` has no concept of these --
-/// it renders every character as literal cell content, never interprets
-/// a sequence as "erase" or "move cursor" -- so left unstripped, only the
-/// `ESC` byte itself (a control character) would be removed by
-/// `sanitize_for_display`'s final filter, leaving the rest of the
-/// sequence to show up as garbage literal text (e.g. `[K`).
-///
-/// This does not make erase/cursor-movement sequences actually erase or
-/// move anything in the rendered output -- `Line`/`Paragraph` still just
-/// concatenate whatever text remains, the same simplification the
-/// existing bare-backspace (`\x08`) handling already has (see
-/// `sanitize_for_display_strips_a_trailing_control_character`'s test).
-/// It only prevents the sequence's own bytes from appearing as visible
-/// garbage; real cursor-aware in-place editing within a growing line is
-/// a bigger feature this does not attempt.
-fn strip_escape_sequences(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+/// Replays a raw device-output string through a minimal single-line
+/// cursor model before it's handed to ratatui for display. `Line`/`Span`
+/// render every character as literal, non-advancing cell content -- they
+/// are not a terminal emulator and don't interpret control bytes or
+/// escape sequences. Two real hardware reports made that gap visible:
+/// FortiGate's `--More--` paging erases its own prompt with a
+/// `\r`-erase-`\r` sequence (v0.1.6, corrupted the real terminal once
+/// crossterm wrote the literal `\r` to it -- see `LineAssembler::feed`'s
+/// `embedded_carriage_returns_survive_into_the_emitted_line` test for why
+/// this survives verbatim into the assembled line, by design, and the fix
+/// belongs here, not there); a device's Backspace response left literal
+/// `[K` visible on screen (v0.1.7/v0.1.8's `\x1b[K`, since only the bare
+/// `ESC` byte was a control character). Both were fixed with ad hoc
+/// pattern-specific rules (`\r`-collapse, then CSI-stripping) that
+/// removed the garbage but never made editing *correct* -- a bare
+/// `\x08\x1b[K` still left the character it was erasing in place, just
+/// with the escape bytes gone instead of visible. This replaces both
+/// rules with one general model: replay the bytes against a virtual
+/// cursor over a single line of cells, the same way a real terminal
+/// would for one line of input (not a full 2D screen -- no cursor
+/// row/column addressing, no scroll regions, no SGR/color; only what a
+/// device's own line-editing echo plausibly sends: `\r` returns to
+/// column 0, `\x08` moves the cursor left without erasing, `\x7f` (DEL)
+/// moves left *and* deletes that cell, `\x1b[K`/`\x1b[1K`/`\x1b[2K` erase
+/// in line, `\x1b[nD`/`\x1b[nC` move the cursor). Printable characters
+/// overwrite the cell at the cursor if one exists there, otherwise
+/// append -- this is what makes a `\r`-prefixed redraw (or a device
+/// overwriting a shorter reply over a longer one) look right instead of
+/// mashed together. Any other escape sequence's final byte (SGR color,
+/// cursor positioning, screen clear, ...) is recognized and consumed but
+/// has no visible effect here -- out of scope for a single-line model.
+fn visible_text(text: &str) -> String {
+    let mut cells: Vec<char> = Vec::new();
+    let mut cursor: usize = 0;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
+        match c {
+            '\r' => cursor = 0,
+            '\x08' => cursor = cursor.saturating_sub(1),
+            '\x7f' => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    cells.remove(cursor);
+                }
+            }
+            '\u{1b}' if chars.peek() == Some(&'[') => {
                 chars.next(); // consume '['
+                let mut params = String::new();
                 while matches!(chars.peek(), Some(&p) if (' '..='?').contains(&p)) {
-                    chars.next();
+                    if let Some(p) = chars.next() {
+                        params.push(p);
+                    }
                 }
-                if matches!(chars.peek(), Some(&p) if ('@'..='~').contains(&p)) {
-                    chars.next();
+                match chars.next() {
+                    Some('D') => {
+                        let n: usize = params.parse().unwrap_or(1).max(1);
+                        cursor = cursor.saturating_sub(n);
+                    }
+                    Some('C') => {
+                        let n: usize = params.parse().unwrap_or(1).max(1);
+                        cursor = (cursor + n).min(cells.len());
+                    }
+                    Some('K') => match params.as_str() {
+                        // Erase to start of line: blanks in place rather
+                        // than removing cells, so later cells keep their
+                        // column position (matches a real terminal --
+                        // erasing never shifts unrelated text).
+                        "1" => {
+                            let end = cursor.min(cells.len());
+                            for cell in cells.iter_mut().take(end) {
+                                *cell = ' ';
+                            }
+                        }
+                        // Erase entire line.
+                        "2" => {
+                            cells.clear();
+                            cursor = 0;
+                        }
+                        // Erase to end of line (default with no param).
+                        _ => cells.truncate(cursor),
+                    },
+                    // Any other CSI final byte (SGR color, cursor
+                    // positioning, screen clear, ...): consumed, no
+                    // visible effect -- out of scope for one line.
+                    _ => {}
                 }
             }
-            Some(_) => {
-                chars.next(); // consume the one byte after ESC
+            '\u{1b}' => {
+                if chars.peek().is_some() {
+                    chars.next(); // consume the one byte after ESC
+                }
             }
-            None => {}
+            other if !other.is_control() => {
+                if cursor < cells.len() {
+                    cells[cursor] = other;
+                } else {
+                    cells.push(other);
+                }
+                cursor += 1;
+            }
+            _ => {} // any other raw control byte (bell, ...): no cell effect
         }
     }
-    out
+    cells.into_iter().collect()
 }
 
 /// Prepares a live partial-line preview for display: unlike a finished
 /// scrollback line (read once, doesn't change), a partial line keeps
 /// growing, and what's new is always at the end -- so this shows the
 /// *tail*, not the head, once it's too long for the pane's width, after
-/// `sanitize_for_display` above has already handled `\r`/control bytes.
-/// `Paragraph` without `.wrap()` renders from the start of the string and
-/// clips at the area edge, so an unbounded-length line (Cisco `copy`
-/// progress marks, any command with no newline until it finishes) would
-/// otherwise render its first ~`width` characters once and then appear
-/// frozen while the device keeps working -- indistinguishable from an
-/// actual hang, the exact symptom this feature exists to rule out.
+/// `visible_text` above has already replayed `\r`/backspace/escape bytes
+/// against a virtual cursor. `Paragraph` without `.wrap()` renders from
+/// the start of the string and clips at the area edge, so an unbounded-
+/// length line (Cisco `copy` progress marks, any command with no newline
+/// until it finishes) would otherwise render its first ~`width`
+/// characters once and then appear frozen while the device keeps
+/// working -- indistinguishable from an actual hang, the exact symptom
+/// this feature exists to rule out.
 fn partial_line_preview(partial: &str, width: u16) -> String {
-    let sanitized = sanitize_for_display(partial);
+    let sanitized = visible_text(partial);
     let width = width as usize;
     let char_count = sanitized.chars().count();
     if char_count <= width {
@@ -156,7 +172,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Positi
         .scrollback
         .iter()
         .skip(visible_start)
-        .map(|line| Line::from(sanitize_for_display(line)))
+        .map(|line| Line::from(visible_text(line)))
         .collect();
 
     if let Some(partial) = &session.partial_output {
@@ -396,13 +412,23 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_for_display_strips_a_trailing_control_character() {
-        assert_eq!(sanitize_for_display("no controls here"), "no controls here");
-        assert_eq!(sanitize_for_display("backspace\x08here"), "backspacehere");
+    fn visible_text_leaves_plain_text_unchanged() {
+        assert_eq!(visible_text("no controls here"), "no controls here");
     }
 
     #[test]
-    fn sanitize_for_display_collapses_a_fortigate_style_erase_sequence() {
+    fn visible_text_genuinely_erases_on_backspace_not_just_strips_the_byte() {
+        // v0.1.6-v0.1.8's naive "strip the control byte" approach left
+        // "backspace" + "here" concatenated as "backspacehere" -- the
+        // \x08 byte was gone but nothing was actually erased. A real
+        // terminal moves the cursor left on \x08 without erasing; typing
+        // "here" starting from that position overwrites the trailing "e"
+        // of "backspace" instead of appending after it.
+        assert_eq!(visible_text("backspace\x08here"), "backspachere");
+    }
+
+    #[test]
+    fn visible_text_collapses_a_fortigate_style_erase_sequence() {
         // Real hardware capture: FortiGate's `--More--` paging erases its
         // own prompt with `\r` + spaces + `\r` before printing the next
         // line -- confirmed to survive verbatim into the assembled
@@ -411,31 +437,58 @@ mod tests {
         // *does* interpret it, unlike `Line`) and corrupts everything
         // rendered afterward in the same paint.
         assert_eq!(
-            sanitize_for_display("\r        \rvirtual domain: root"),
+            visible_text("\r        \rvirtual domain: root"),
             "virtual domain: root"
         );
     }
 
     #[test]
-    fn sanitize_for_display_strips_an_erase_in_line_escape_sequence() {
-        // Regression test for a real device response to raw passthrough
-        // mode's Backspace: the device answered with `\x1b[K` (ANSI
-        // erase-in-line). The bare ESC byte was already a control
-        // character and got stripped, but `[` and `K` are ordinary
-        // printable characters -- without `strip_escape_sequences`,
-        // "user[K" would render with the literal garbage text "[K"
-        // visible, exactly as reported.
-        assert_eq!(sanitize_for_display("user\x1b[K"), "user");
-        assert_eq!(sanitize_for_display("user\x1b[Ks"), "users");
-    }
-
-    #[test]
-    fn sanitize_for_display_strips_a_color_escape_sequence() {
+    fn visible_text_strips_a_color_escape_sequence() {
         // A CSI sequence can carry any number of parameter bytes before
         // its final byte, not just none -- e.g. an SGR color code like
         // `\x1b[1;32m` (bold green). Proves the parameter-byte loop
         // consumes the whole sequence, not just a single-parameter case.
-        assert_eq!(sanitize_for_display("\x1b[1;32mok\x1b[0m"), "ok");
+        // Color has no visible effect in this single-line model (no
+        // styling pass-through), but the escape bytes themselves must
+        // not leak into the rendered text as literal garbage.
+        assert_eq!(visible_text("\x1b[1;32mok\x1b[0m"), "ok");
+    }
+
+    // Three real-world backspace idioms a device's line-editing echo
+    // might use -- whichever one a given device turns out to send,
+    // there's a test here already proving ttyt renders it correctly.
+    // (v0.1.8 shipped a fix for one specific case, `\x1b[K` alone, that
+    // turned out not to be enough on its own -- these cover the ones
+    // most likely to be the rest of the real sequence.)
+
+    #[test]
+    fn visible_text_erases_via_the_backspace_space_backspace_idiom() {
+        // BS moves left, a space overwrites the cell, BS moves left
+        // again -- the classic dumb-terminal erase pattern that needs no
+        // escape sequences at all.
+        assert_eq!(visible_text("user\x08 \x08"), "use ");
+    }
+
+    #[test]
+    fn visible_text_erases_via_cursor_left_then_erase_in_line() {
+        // BS (or `\x1b[D`) moves the cursor left without erasing, then
+        // `\x1b[K` erases from there to the end of the line -- a common
+        // pairing since it also correctly erases more than one trailing
+        // character if the cursor moved back further than one cell.
+        assert_eq!(visible_text("user\x08\x1b[K"), "use");
+        assert_eq!(visible_text("user\x1b[D\x1b[K"), "use");
+    }
+
+    #[test]
+    fn visible_text_erases_several_characters_via_repeated_cursor_left_then_one_erase() {
+        // A device optimizing multi-character Backspace echoes several
+        // bare `\x08` (cursor-left only, no per-character erase) followed
+        // by a single trailing `\x1b[K` rather than repeating a full
+        // erase pattern per keystroke. The naive v0.1.6-v0.1.8 model
+        // (strip control/escape bytes, concatenate what's left) had no
+        // concept of the cursor moving backward at all here and would
+        // have rendered the untouched "user1234".
+        assert_eq!(visible_text("user1234\x08\x08\x08\x08\x1b[K"), "user");
     }
 
     /// End-to-end proof, not just the pure-function test above: a
