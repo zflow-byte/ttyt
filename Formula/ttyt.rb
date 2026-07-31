@@ -3,7 +3,7 @@
 # This is the canonical copy, kept in sync with the same file published
 # at github.com/zflow-byte/homebrew-ttyt (the real tap end users install
 # from: `brew tap zflow-byte/ttyt && brew install ttyt`). Verified against
-# v0.1.2's real release tarball (build + `brew test` both passed): `sha256`
+# v0.1.3's real release tarball (build + `brew test` both passed): `sha256`
 # below is the real hash, not a placeholder.
 #
 # To exercise this exact file locally instead of the published tap
@@ -16,8 +16,8 @@
 class Ttyt < Formula
   desc "TUI serial/network console for Cisco, Dell OS10, Aruba CX, Comware, JunOS"
   homepage "https://github.com/zflow-byte/ttyt"
-  url "https://github.com/zflow-byte/ttyt/archive/refs/tags/v0.1.2.tar.gz"
-  sha256 "4c5a611613a9bf380f098624c20c2d6609d9ada38b8ef65057bea0f035aa95c3"
+  url "https://github.com/zflow-byte/ttyt/archive/refs/tags/v0.1.3.tar.gz"
+  sha256 "2b44f738205ca8af6dad6dfa660348b3e489df73705811de04c52cd417ed30fa"
   license "MIT"
   head "https://github.com/zflow-byte/ttyt.git", branch: "main"
 
