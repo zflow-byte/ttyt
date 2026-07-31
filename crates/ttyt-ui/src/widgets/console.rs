@@ -7,40 +7,63 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::App;
 use crate::theme::Theme;
 
+/// Strips terminal control characters before a line is handed to ratatui
+/// for display. `Line`/`Span` render every character as literal, non-
+/// advancing cell content -- they are not a terminal emulator and don't
+/// interpret control bytes. crossterm then writes those cells verbatim to
+/// the real terminal, which *does* interpret them: a `\r` moves the
+/// cursor back to column 0, and everything ttyt draws afterward in the
+/// same paint overwrites earlier screen content instead of advancing past
+/// it. Confirmed against real FortiGate hardware: `--More--` paging
+/// erases its own prompt with a `\r`-erase-`\r` sequence before printing
+/// more text (`LineAssembler::feed`'s
+/// `embedded_carriage_returns_survive_into_the_emitted_line` test
+/// documents that this survives into the assembled line verbatim, by
+/// design -- the fix belongs here, not there). Left unsanitized, that one
+/// `\r` corrupted everything rendered after it for the rest of the paint:
+/// the Sessions pane's border vanished on the affected rows, and device
+/// text came out visibly overtyped mid-word ("Maxonumber" for "Max
+/// number", "vir ual" for "virtual" -- same length, characters
+/// overwritten in place, not dropped).
+///
+/// Collapses to the segment after the last `\r` (what a real terminal
+/// would show once every erase-and-redraw in the sequence has played
+/// out) -- this also handles a `\r`-based progress counter that
+/// overwrites the same column rather than appending, e.g. `10%\r20%\r30%`
+/// becomes `30%` instead of the stages rendering mashed together. Then
+/// strips any other control character (backspace, stray ANSI bytes, ...)
+/// that survives: these have no rendering meaning to `Line` either, and
+/// keeping them risks the same class of corruption `\r` caused.
+fn sanitize_for_display(text: &str) -> String {
+    let after_last_cr = match text.rfind('\r') {
+        Some(idx) => &text[idx + 1..],
+        None => text,
+    };
+    after_last_cr.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Prepares a live partial-line preview for display: unlike a finished
 /// scrollback line (read once, doesn't change), a partial line keeps
 /// growing, and what's new is always at the end -- so this shows the
-/// *tail*, not the head, once it's too long for the pane's width.
+/// *tail*, not the head, once it's too long for the pane's width, after
+/// `sanitize_for_display` above has already handled `\r`/control bytes.
 /// `Paragraph` without `.wrap()` renders from the start of the string and
 /// clips at the area edge, so an unbounded-length line (Cisco `copy`
 /// progress marks, any command with no newline until it finishes) would
 /// otherwise render its first ~`width` characters once and then appear
 /// frozen while the device keeps working -- indistinguishable from an
 /// actual hang, the exact symptom this feature exists to rule out.
-///
-/// Also collapses a `\r`-based progress display (percentage counters that
-/// overwrite the same terminal column rather than appending, e.g.
-/// `10%\r20%\r30%`) to only the segment after the last `\r`: `Line`
-/// doesn't interpret control characters as cursor movement, so without
-/// this the raw text would render as the stages mashed together
-/// (`10%20%30%`) instead of the current value. `LineAssembler`'s own line
-/// contract is untouched -- this only affects what's shown for the
-/// still-growing preview, not what an eventually-completed line records
-/// to the log or feeds to the redactor.
-fn partial_line_preview(partial: &str, width: u16) -> &str {
-    let after_last_cr = match partial.rfind('\r') {
-        Some(idx) => &partial[idx + 1..],
-        None => partial,
-    };
+fn partial_line_preview(partial: &str, width: u16) -> String {
+    let sanitized = sanitize_for_display(partial);
     let width = width as usize;
-    let char_count = after_last_cr.chars().count();
+    let char_count = sanitized.chars().count();
     if char_count <= width {
-        return after_last_cr;
+        return sanitized;
     }
     let skip = char_count - width;
-    match after_last_cr.char_indices().nth(skip) {
-        Some((byte_idx, _)) => &after_last_cr[byte_idx..],
-        None => after_last_cr,
+    match sanitized.char_indices().nth(skip) {
+        Some((byte_idx, _)) => sanitized[byte_idx..].to_string(),
+        None => sanitized,
     }
 }
 
@@ -77,7 +100,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Positi
         .scrollback
         .iter()
         .skip(visible_start)
-        .map(|line| Line::from(line.as_str()))
+        .map(|line| Line::from(sanitize_for_display(line)))
         .collect();
 
     if let Some(partial) = &session.partial_output {
@@ -313,6 +336,78 @@ mod tests {
         assert!(
             !partial_row.contains("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"),
             "the partial line should not still be showing its stale head, got {partial_row:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_display_strips_a_trailing_control_character() {
+        assert_eq!(sanitize_for_display("no controls here"), "no controls here");
+        assert_eq!(sanitize_for_display("backspace\x08here"), "backspacehere");
+    }
+
+    #[test]
+    fn sanitize_for_display_collapses_a_fortigate_style_erase_sequence() {
+        // Real hardware capture: FortiGate's `--More--` paging erases its
+        // own prompt with `\r` + spaces + `\r` before printing the next
+        // line -- confirmed to survive verbatim into the assembled
+        // `RawLine` by `LineAssembler`'s own test. Left unsanitized here,
+        // that embedded `\r` gets written to the real terminal (which
+        // *does* interpret it, unlike `Line`) and corrupts everything
+        // rendered afterward in the same paint.
+        assert_eq!(
+            sanitize_for_display("\r        \rvirtual domain: root"),
+            "virtual domain: root"
+        );
+    }
+
+    /// End-to-end proof, not just the pure-function test above: a
+    /// scrollback line carrying the exact FortiGate erase sequence must
+    /// render as clean text with no `\r` (or any other control character)
+    /// present in any rendered cell -- if one were, ratatui would have
+    /// stored the literal `\r` byte, crossterm would write it to the real
+    /// terminal, and the terminal itself (not ttyt) would act on it,
+    /// which is invisible to a `TestBackend` assertion unless it checks
+    /// cell *content* directly, as this does.
+    #[test]
+    fn scrollback_line_with_embedded_carriage_return_renders_with_no_control_bytes() {
+        let width = 40u16;
+        let height = 10u16;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut app = App::new();
+        app.active_session_mut()
+            .push_line("\r        \rvirtual domain: root".to_string());
+        let theme = Theme::dark();
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, area, &app, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for cell in buffer.content() {
+            let symbol = cell.symbol();
+            assert!(
+                symbol.chars().all(|c| !c.is_control()),
+                "no rendered cell should contain a raw control character, found {symbol:?}"
+            );
+        }
+
+        // Inner height is 8; with only one scrollback line, `Paragraph`'s
+        // leading-blank-line padding (see the top-alignment fix above)
+        // pushes it down to sit immediately above the input line (y=8),
+        // i.e. y=7 -- not the pane's first row.
+        let line_row = row_text(buffer, 7, width);
+        assert!(
+            line_row.contains("virtual domain: root"),
+            "the sanitized line content should still be visible, got {line_row:?}"
         );
     }
 }

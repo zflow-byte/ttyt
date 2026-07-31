@@ -695,3 +695,74 @@ Full fmt/clippy -D warnings/test clean: 246 tests (162 core + 81 ui + 3
 cli), up from 245 in v0.1.4. Bumped workspace version 0.1.4 -> 0.1.5,
 tagged and pushed `v0.1.5`; Formula/ttyt.rb's `url`/`sha256` updated to
 point at the real v0.1.5 tarball in both this repo and the published tap.
+
+**Root cause of the "Current" corruption found and fixed, v0.1.6.** The
+v0.1.5 fix addressed a real but secondary bug (`Ctrl+L` not clearing a
+stuck partial preview); the user reported the corruption itself
+unchanged after upgrading. A second, clearer hardware capture (full
+`ttyt` window with box-drawing borders intact, not just a text
+fragment) made the actual mechanism identifiable: the Sessions pane's
+right border was missing on exactly the affected rows, and console text
+was overtyped mid-word with the *same length* ("Maxonumber" for "Max
+number", "vir ual" for "virtual") -- not corrupted or dropped, *typed
+over*.
+
+That's the signature of a literal `\r` (carriage return) reaching the
+real terminal. FortiGate's `--More--` paging erases its own prompt with
+a `\r`-erase-`\r` sequence before printing the next line (confirmed via
+a real hardware byte capture: `"\r        \rvirtual domain: root\r\n"`).
+`LineAssembler` only ever strips a *trailing* `\r` immediately before
+`\n` -- embedded ones survive into the assembled line verbatim, by
+design (this is correct: the log/redaction contract should reflect what
+the device actually sent). `widgets/console.rs` handed that string
+straight to `ratatui::text::Line` with no sanitizing. `Line` treats
+every character as literal, non-advancing cell content -- it is not a
+terminal emulator -- but crossterm then writes those cells to the real
+terminal verbatim, and the *real terminal* interprets `\r` as "return to
+column 0." Everything ttyt drew after that point in the same paint
+landed at the wrong columns, overwriting the Sessions pane's border and
+whatever text was already there -- exactly matching the report, down to
+the fact that Ctrl+L had no effect (it isn't stale state; the corrupted
+line is re-rendered from `scrollback` on every single frame) and why it
+started exactly at the first `--More--` (the first point FortiGate
+sends this erase sequence).
+
+An earlier attempt to diagnose this asked whether the string "Current"
+appeared in the session's recorded log file, reasoning that the
+recorder only ever sees real `RawLine`/`PaginationPrompt` content, never
+rendering-only state -- if absent, that would point away from real
+device data. The user reported it was absent. That check was
+misleading: `"Current Security Level: High"` is itself a real,
+literal line from the device's own `get system status` output, so it
+must be in the log regardless of this bug -- the earlier answer most
+likely came from checking the wrong log file (a different day directory
+or session), not genuine evidence the corruption wasn't real device
+content. Recorded here as a caution for next time: a log-presence check
+is only as good as confirming it's actually the right log file first.
+
+Fixed with a new `sanitize_for_display` helper in `widgets/console.rs`,
+applied to every scrollback line (previously handed to `Line::from`
+completely unsanitized) and generalized from the `\r`-collapse logic
+`partial_line_preview` already had for the live preview (v0.1.4):
+collapses to the segment after the last `\r` (what a real terminal would
+show once every erase-and-redraw in a sequence has played out), then
+strips any other control character (backspace, stray ANSI bytes, ...)
+that survives, since none of those have rendering meaning to `Line`
+either and risk the same class of corruption. Deliberately kept at the
+display layer, not in `LineAssembler` -- the log/redaction contract is
+unchanged; a raw `\r` in a log file is harmless.
+
+Verified with a `LineAssembler` test confirming the embedded `\r`
+genuinely survives into the assembled line (documenting that this is
+`LineAssembler`'s correct, unchanged behavior, not the bug) and a
+`TestBackend` regression test asserting the real hardware sequence
+renders with **zero control characters in any cell** across the whole
+buffer, not just that the visible text happens to look right --
+confirmed as a genuine catch via the usual revert-and-confirm-fail
+cycle (reverted the scrollback sanitize call, test failed with `found
+"\r"` at the exact predicted cell, restored it, test passed).
+
+Full fmt/clippy -D warnings/test clean: 250 tests (163 core + 84 ui + 3
+cli), up from 246 in v0.1.5. Bumped workspace version 0.1.5 -> 0.1.6,
+tagged and pushed `v0.1.6`; Formula/ttyt.rb's `url`/`sha256` updated to
+point at the real v0.1.6 tarball in both this repo and the published tap.

@@ -205,6 +205,29 @@ mod tests {
     }
 
     #[test]
+    fn embedded_carriage_returns_survive_into_the_emitted_line() {
+        // Only a *trailing* `\r` immediately before `\n` is stripped --
+        // embedded ones are left completely intact. This is deliberate,
+        // not a gap: FortiGate's `--More--` paging erases the prompt with
+        // a `\r`-erase-`\r` sequence before printing more text (real
+        // hardware capture: `"\r        \rvirtual domain: root\r\n"`), and
+        // callers that need this stripped for on-screen display (a real
+        // terminal treats `\r` as "return to column 0", which corrupts
+        // whatever's rendered after it if left in verbatim) do so at the
+        // display layer -- see `ttyt-ui`'s `sanitize_for_display` -- not
+        // here. The log/redaction contract cares about what the device
+        // actually sent, not how a terminal would visually interpret it.
+        let mut assembler = LineAssembler::new();
+        let output = assembler.feed(b"\r        \rvirtual domain: root\r\n");
+        assert_eq!(
+            output,
+            vec![AssembledOutput::Line(
+                "\r        \rvirtual domain: root".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn cisco_style_more_prompt_with_no_newline_is_recognized() {
         let mut assembler = LineAssembler::new();
         let output = assembler.feed(b"line one\r\n--More--");
